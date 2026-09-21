@@ -14,8 +14,8 @@
 - **Aluno 1 - Nome**: <mark>`Fábio Luiz da Costa Cieslak`</mark>
 - **Aluno 1 - Cartão UFRGS**: <mark>`00343799`</mark>
 
-- **Aluno 2 - Nome**: <mark>`<preencher>`</mark>
-- **Aluno 2 - Cartão UFRGS**: <mark>`<preencher>`</mark>
+- **Aluno 2 - Nome**: <mark>`Leonardo Greco Fin`</mark>
+- **Aluno 2 - Cartão UFRGS**: <mark>`00595687`</mark>
 
 ## Detalhes do que será implementado
 
