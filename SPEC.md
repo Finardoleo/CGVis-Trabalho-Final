@@ -11,16 +11,16 @@
 
 ## Integrantes da dupla
 
-- **Aluno 1 - Nome**: <mark>`<preencher>`</mark>
-- **Aluno 1 - Cartão UFRGS**: <mark>`<preencher>`</mark>
+- **Aluno 1 - Nome**: <mark>`Fábio Luiz da Costa Cieslak`</mark>
+- **Aluno 1 - Cartão UFRGS**: <mark>`00343799`</mark>
 
 - **Aluno 2 - Nome**: <mark>`<preencher>`</mark>
 - **Aluno 2 - Cartão UFRGS**: <mark>`<preencher>`</mark>
 
 ## Detalhes do que será implementado
 
-- **Título do trabalho**: <mark>`<preencher>`</mark>
-- **Parágrafo curto descrevendo o que será implementado**: <mark>`<preencher>`</mark>
+- **Título do trabalho**: <mark>`Masmorra Stealth 3D`</mark>
+- **Parágrafo curto descrevendo o que será implementado**: <mark>`Jogo 3D de exploração e furtividade ambientado em uma masmorra. O jogador controla um personagem que precisa coletar chaves e tesouros e chegar à saída sem ser capturado por criaturas que patrulham o ambiente. As criaturas seguem rotas curvas (Bézier) e possuem um cone de visão; o jogador deve avançar apenas quando elas estiverem de costas, podendo se agachar para se esconder atrás de obstáculos. O jogo terá duas câmeras (3ª pessoa e mapa/top-down), HUD com minimapa, iluminação com tochas e colisões com raycast para a linha de visão.`</mark>
 
 ## Especificação visual
 
