@@ -103,6 +103,10 @@ As colisões serão implementadas em collisions.cpp e incluirão: colisão jogad
 ### Modelos de Iluminação em todos os objetos
 Será utilizado o modelo de Phong com iluminação ambiente baixa e múltiplas luzes pontuais representando as tochas da masmorra. O cajado mágico final também emitirá uma luz intensa. Todos os objetos terão iluminação aplicada.
 
+> Comentário Professor: Deem ao chão uma aparência brilhante (glossy), conforme a referência visual. O modelo de iluminação de Phong deve ser suficiente para vocês reproduzirem esse efeito.
+
+> Comentário Professor: Para obterem a iluminação desejada, considerem o decaimento da intensidade luminosa com a distância.
+
 ### Mapeamento de texturas em todos os objetos
 Todos os objetos terão texturas de imagem (pedra, madeira, metal) provenientes dos pacotes CC0 utilizados, além de possíveis texturas procedurais para detalhes.
 
