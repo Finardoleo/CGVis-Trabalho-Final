@@ -248,33 +248,29 @@ const float PLAYER_MODEL_SCALE  = 0.72f; // o modelo do ladrão tem 2.24 de altu
 //   '#' parede        '.' chão          'S' início do jogador
 //   'c' caixote (dá para se esconder)
 //   'b' barril        'B' baú           'K' chave      '$' tesouro
-//   'G' portão da sala do tesouro (abre com a chave)
+//   'G' portão da sala do tesouro (todos abrem com a chave)
 //   'Z' cajado mágico (o prêmio: pegá-lo termina o jogo)
 //   'P' pilar decorado
-// A sala do tesouro fica no centro (linhas 7..11, colunas 9..13) e tem uma
+// A sala do tesouro fica no centro (linhas 5..9, colunas 7..11) e tem uma
 // decoração diferente: piso de madeira escura, estandartes verdes, ouro e a
 // luz verde do cajado.
 const float CELL_SIZE = 4.0f;
 const char* DUNGEON_MAP[] = {
-    "#######################",
-    "#S#.......#$.........$#",
-    "#.#.#####.###.#######.#",
-    "#.#...#$...........K#.#",
-    "#.#...#########.#.c.#.#",
-    "#.....#..c...c..#...#.#",
-    "###.###.#######.#.#.#.#",
-    "#b...B#.#$...$#.#...#.#",
-    "#.#.###.#.P.P.#.#.###.#",
-    "#.#b..#c#..Z..#c#...#.#",
-    "#.###.#.#.P.P.#.#.#.#.#",
-    "#.....#.#$...$#.#...#.#",
-    "#.#####.###G###.#.###.#",
-    "#.#$.....c...c..#.....#",
-    "#.#.c.###########.c.#.#",
-    "#.............#....$..#",
-    "#.###########.#.###.#.#",
-    "#$.........$#........$#",
-    "#######################",
+    "###################",
+    "#S#..............K#",
+    "#.#.#.#########.c.#",
+    "#.#$#....c........#",
+    "#.###.####G##.#.#.#",
+    "#b....#$...$#c#.#$#",
+    "###.#.#.P.P.#.#.###",
+    "#...#c#..Z..G.#...#",
+    "#.#.#.#.P.P.#.#.#.#",
+    "#..b#.#$...$#.#.#.#",
+    "###.#.#######.#.#.#",
+    "#$..#..c...c..#...#",
+    "#...###########.c.#",
+    "#........$.......$#",
+    "###################",
 };
 const int MAP_ROWS = sizeof(DUNGEON_MAP) / sizeof(DUNGEON_MAP[0]);
 int MapCols() { return (int)strlen(DUNGEON_MAP[0]); }
@@ -283,7 +279,7 @@ char MapAt(int row, int col)
     if (row < 0 || row >= MAP_ROWS || col < 0 || col >= MapCols()) return '#';
     return DUNGEON_MAP[row][col];
 }
-bool IsTreasureRoom(int row, int col) { return row >= 7 && row <= 11 && col >= 9 && col <= 13; }
+bool IsTreasureRoom(int row, int col) { return row >= 5 && row <= 9 && col >= 7 && col <= 11; }
 
 // Centro da célula (row, col) no mundo.
 glm::vec3 CellCenter(int row, int col) { return glm::vec3(col * CELL_SIZE, 0.0f, row * CELL_SIZE); }
@@ -320,6 +316,9 @@ struct Skeleton
     // parando alguns segundos em cada uma.
     float yaw_a, yaw_b, phase;
 
+    // Modelo: esqueleto de capuz ou de capacete com chifres.
+    bool helmet;
+
     // Visão: true se o esqueleto está vendo o jogador neste quadro.
     bool sees_player;
 };
@@ -342,6 +341,7 @@ const float CATCH_DISTANCE       = 1.1f;  // encostar no esqueleto = captura
 // perto), desce quando ninguém vê. Ao chegar em 1, o jogador é capturado.
 float g_Alert = 0.0f;
 float g_CaptureTimer = 0.0f; // > 0 durante a "cena" de captura
+bool  g_KeyLost = false;      // a chave voltou para o lugar nesta captura
 glm::vec3 g_StartPos;
 float g_StartYaw = 0.0f;
 
@@ -372,13 +372,19 @@ bool g_HasKey = false;
 int  g_TreasureCount = 0, g_TreasureTotal = 0;
 const float PICKUP_DISTANCE = 1.3f;
 
-// Portão da sala do tesouro: sobe (animação por delta_t) quando o jogador
-// chega perto com a chave; a caixa de colisão é removida.
-int       g_GateInstance = -1, g_GateCollider = -1;
-glm::mat4 g_GateBaseModel;
-glm::vec3 g_GatePos;
-AABB      g_GateBox;
-float     g_GateOpening = 0.0f; // 0 = fechado, 1 = aberto
+// Portões da sala do tesouro (um à direita e um em cima): cada um sobe
+// (animação por delta_t) quando o jogador chega perto com a chave; a caixa
+// de colisão dele é removida.
+struct Gate
+{
+    int       instance, collider; // índices em g_Instances e g_Colliders
+    glm::mat4 base_model;
+    glm::vec3 pos;
+    AABB      box;               // caixa de colisão original (para o reset)
+    float     opening;           // 0 = fechado, 1 = aberto
+};
+std::vector<Gate> g_Gates;
+const float GATE_OPEN_DISTANCE = 4.5f;
 
 // Final: ao pegar o cajado (E), o ladrão dá um pulinho, o cajado solta um
 // clarão (a tela vai ficando branca) e o jogo termina.
@@ -403,6 +409,23 @@ bool g_ConfirmPressed  = false; // ENTER
 float FlatDistance(glm::vec3 a, glm::vec3 b)
 {
     return glm::length(glm::vec2(a.x - b.x, a.z - b.z));
+}
+
+// Distância do jogador até o portão mais próximo.
+float NearestGateDistance()
+{
+    float best = 1e9f;
+    for (const Gate& gate : g_Gates)
+        best = std::min(best, FlatDistance(gate.pos, g_PlayerPos));
+    return best;
+}
+
+// Verdadeiro se algum portão já foi aberto.
+bool AnyGateOpened()
+{
+    for (const Gate& gate : g_Gates)
+        if (gate.opening > 0.0f) return true;
+    return false;
 }
 
 void BuildSkeletons();
@@ -963,7 +986,7 @@ int main(int argc, char* argv[])
                       * Matrix_Rotate_Y(sk.yaw)
                       * Matrix_Scale(ks, ks, ks);
                 glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-                DrawVirtualObject(sk.type == PATROL ? "skeleton" : "skeleton_warrior");
+                DrawVirtualObject(sk.helmet ? "skeleton_warrior" : "skeleton");
             }
 
             // Cajado mágico: flutua (sobe e desce) e gira em torno de Y. Depois
@@ -1073,11 +1096,12 @@ int main(int argc, char* argv[])
 
                 std::string msg;
                 if (g_GameState != PLAYING)      msg = "";
-                else if (g_CaptureTimer > 0.0f)  msg = "CAUGHT! Back to the start...";
+                else if (g_CaptureTimer > 0.0f)  msg = g_KeyLost ? "CAUGHT! The key went back to its place."
+                                                                 : "CAUGHT! Back to the start...";
                 else if (g_PlayerHidden)         msg = "HIDDEN  (move to leave)";
                 else if (!g_StaffTaken && FlatDistance(g_StaffPos, g_PlayerPos) < STAFF_REACH)
                                                  msg = "E: take the magic staff";
-                else if (!g_HasKey && FlatDistance(g_GatePos, g_PlayerPos) < 4.5f)
+                else if (!g_HasKey && NearestGateDistance() < GATE_OPEN_DISTANCE)
                                                  msg = "The gate is locked. Find the key!";
                 else if (NearHideSpot())         msg = "Space: hide";
                 if (!msg.empty())
@@ -2475,7 +2499,7 @@ void BuildDungeon()
             {
                 if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
                 const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
-                add("box_large_Cube.14519", at_center * Matrix_Translate(to_wall.x*1.2f, 0.0f, to_wall.z*1.2f), true);
+                add("box_large_Cube.14519", at_center * Matrix_Translate(to_wall.x*1.25f, 0.0f, to_wall.z*1.25f), true);
                 placed = true;
                 break;
             }
@@ -2528,7 +2552,8 @@ void BuildDungeon()
         case 'K':
         {
             // A chave flutua e gira (animada em UpdateObjectives).
-            const glm::mat4 m = at_center * Matrix_Translate(0.0f, 1.0f, 0.0f);
+            // (1.6x maior que o modelo original, para ser fácil de ver.)
+            const glm::mat4 m = at_center * Matrix_Translate(0.0f, 1.1f, 0.0f) * Matrix_Scale(1.6f, 1.6f, 1.6f);
             add("key_Torus.035", m, false);
             g_Pickups.push_back({ (int)g_Instances.size() - 1, m, center, true, false });
             break;
@@ -2540,12 +2565,15 @@ void BuildDungeon()
             // fica ao longo de X; senão, girada 90 graus. Por enquanto fica
             // sempre fechado (é uma caixa de colisão).
             const bool corridor_along_z = MapAt(r - 1, c) != '#' && MapAt(r + 1, c) != '#';
-            g_GateBaseModel = at_center * Matrix_Rotate_Y(corridor_along_z ? 0.0f : PI_2);
-            add("wall_gated_Cube.13125", g_GateBaseModel, true);
-            g_GateInstance = (int)g_Instances.size() - 1;
-            g_GateCollider = (int)g_Colliders.size() - 1;
-            g_GateBox      = g_Colliders.back();
-            g_GatePos      = center;
+            Gate gate;
+            gate.base_model = at_center * Matrix_Rotate_Y(corridor_along_z ? 0.0f : PI_2);
+            add("wall_gated_Cube.13125", gate.base_model, true);
+            gate.instance = (int)g_Instances.size() - 1;
+            gate.collider = (int)g_Colliders.size() - 1;
+            gate.box      = g_Colliders.back();
+            gate.pos      = center;
+            gate.opening  = 0.0f;
+            g_Gates.push_back(gate);
             break;
         }
         }
@@ -2560,12 +2588,11 @@ void BuildSkeletons()
     const PatrolDef patrols[] = {
         // Dois esqueletos dando a volta no corredor em torno da sala do
         // tesouro (a mesma rota fechada; o segundo começa do lado oposto).
-        { true,  { {5, 7}, {5, 15}, {13, 15}, {13, 7} } },
-        { true,  { {13, 15}, {13, 7}, {5, 7}, {5, 15} } },
-        // Corredores longos (vão e voltam).
-        { false, { {15, 7}, {15, 13} } },
-        { false, { {3, 8}, {3, 15} } },
-        { false, { {2, 21}, {16, 21} } },
+        { true,  { {3, 5}, {3, 13}, {11, 13}, {11, 5} } },
+        { true,  { {11, 13}, {11, 5}, {3, 5}, {3, 13} } },
+        // Corredores longos de cima e de baixo (vão e voltam).
+        { false, { {1, 3}, {1, 13} } },
+        { false, { {13, 4}, {13, 14} } },
     };
 
     int index = 0;
@@ -2603,23 +2630,21 @@ void BuildSkeletons()
         sk.pos       = points[0];
         sk.yaw       = 0.0f;
         sk.yaw_a = sk.yaw_b = 0.0f;
+        sk.helmet    = false; // patrulheiros: esqueletos de capuz
         sk.phase     = 1.3f * index++;
         sk.sees_player = false;
         g_Skeletons.push_back(sk);
     }
 
-    // Guardas: um em cada salinha de chave. Ficam num canto, alternando o
-    // olhar entre duas direções. A chave fica no canto oposto, escondida
-    // atrás de uma pilha de caixotes: é preciso esperar o guarda olhar para
-    // o outro lado e se esconder pelo caminho.
-    // yaw: 0 = sul (+Z), PI = norte (-Z), PI/2 = leste (+X), -PI/2 = oeste.
+    // Guardas parados (esqueletos de capacete): ficam numa célula alternando
+    // o olhar entre duas direções. yaw: 0 = sul (+Z), PI = norte (-Z),
+    // PI/2 = leste (+X), -PI/2 = oeste.
     struct GuardDef { int row, col; float yaw_a, yaw_b; };
     const float PI   = 3.141592f;
     const float PI_2 = 1.570796f;
-    const GuardDef guards[] = {
-        { 5, 17,  PI,   PI_2 },  // salinha de cima à direita: norte / leste
-        { 15, 5,  PI,  -PI_2 },  // salinha de baixo à esquerda: norte / oeste
-        { 13, 17, PI_2, 0.0f },  // salinha de baixo à direita: leste / sul
+    const std::vector<GuardDef> guards = {
+        { 3, 15,  PI,   PI_2 },  // salinha da chave (em cima, à direita): norte / leste
+        { 11, 15, 0.0f, PI_2 },  // salinha do tesouro (embaixo, à direita): sul / leste
     };
     for (const GuardDef& def : guards)
     {
@@ -2629,6 +2654,7 @@ void BuildSkeletons()
         sk.yaw_a = def.yaw_a;
         sk.yaw_b = def.yaw_b;
         sk.yaw   = def.yaw_a;
+        sk.helmet = true;
         sk.phase = 1.7f * index++;
         sk.closed = false; sk.u = 0.0f; sk.direction = 1.0f; sk.speed = 0.0f;
         sk.sees_player = false;
@@ -2791,6 +2817,21 @@ void CapturePlayer()
 {
     g_CaptureTimer = 2.0f;
     g_PlayerHidden = false;
+
+    // Se ainda não abriu o portão, o jogador perde a chave: ela volta para
+    // o lugar dela (os tesouros já coletados continuam com ele).
+    g_KeyLost = false;
+    if (g_HasKey && !AnyGateOpened())
+    {
+        g_HasKey  = false;
+        g_KeyLost = true;
+        for (Pickup& p : g_Pickups)
+            if (p.is_key)
+            {
+                p.taken = false;
+                g_Instances[p.instance].visible = true;
+            }
+    }
 }
 
 // Verdadeiro se o jogador está perto de algum esconderijo (distância, no
@@ -2899,9 +2940,10 @@ void UpdateObjectives(GLFWwindow* window, float delta_t)
             }
         }
 
-        // Portão: com a chave, abre ao chegar perto.
-        if (g_HasKey && g_GateOpening == 0.0f && FlatDistance(g_GatePos, g_PlayerPos) < 4.5f)
-            g_GateOpening = 0.0001f;
+        // Portões: com a chave, cada um abre ao chegar perto dele.
+        for (Gate& gate : g_Gates)
+            if (g_HasKey && gate.opening == 0.0f && FlatDistance(gate.pos, g_PlayerPos) < GATE_OPEN_DISTANCE)
+                gate.opening = 0.0001f;
 
         // E perto do cajado: pegar.
         if (!g_StaffTaken && FlatDistance(g_StaffPos, g_PlayerPos) < STAFF_REACH && g_InteractPressed)
@@ -2927,15 +2969,16 @@ void UpdateObjectives(GLFWwindow* window, float delta_t)
 
     // Animação do portão subindo (1.5 s). Quando já subiu o bastante, a
     // caixa de colisão é levada para longe (o jogador passa).
-    if (g_GateOpening > 0.0f && g_GateOpening < 1.0f)
+    for (Gate& gate : g_Gates)
     {
-        g_GateOpening = std::min(1.0f, g_GateOpening + delta_t / 1.5f);
-        const float s = g_GateOpening * g_GateOpening * (3.0f - 2.0f * g_GateOpening);
-        g_Instances[g_GateInstance].model = Matrix_Translate(0.0f, 3.7f * s, 0.0f) * g_GateBaseModel;
-        if (g_GateOpening > 0.6f)
+        if (gate.opening <= 0.0f || gate.opening >= 1.0f) continue;
+        gate.opening = std::min(1.0f, gate.opening + delta_t / 1.5f);
+        const float s = gate.opening * gate.opening * (3.0f - 2.0f * gate.opening);
+        g_Instances[gate.instance].model = Matrix_Translate(0.0f, 3.7f * s, 0.0f) * gate.base_model;
+        if (gate.opening > 0.6f)
         {
-            g_Colliders[g_GateCollider].min = glm::vec3(0.0f, -200.0f, 0.0f);
-            g_Colliders[g_GateCollider].max = glm::vec3(0.0f, -199.0f, 0.0f);
+            g_Colliders[gate.collider].min = glm::vec3(0.0f, -200.0f, 0.0f);
+            g_Colliders[gate.collider].max = glm::vec3(0.0f, -199.0f, 0.0f);
         }
     }
 }
@@ -2955,9 +2998,12 @@ void ResetGame()
         g_Instances[p.instance].visible = true;
         g_Instances[p.instance].model = p.base_model;
     }
-    g_GateOpening = 0.0f;
-    g_Instances[g_GateInstance].model = g_GateBaseModel;
-    g_Colliders[g_GateCollider] = g_GateBox;
+    for (Gate& gate : g_Gates)
+    {
+        gate.opening = 0.0f;
+        g_Instances[gate.instance].model = gate.base_model;
+        g_Colliders[gate.collider] = gate.box;
+    }
     g_PlayerPos = g_StartPos;
     g_PlayerYaw = g_StartYaw;
     g_PlayerHidden = false;
