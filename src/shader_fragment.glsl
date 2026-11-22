@@ -24,6 +24,7 @@ uniform mat4 projection;
 #define PLANE  2
 #define DUNGEON_OBJECT 3
 #define ROGUE 4
+#define SKELETON 5
 uniform int object_id;
 
 // Parâmetros da axis-aligned bounding box (AABB) do modelo
@@ -35,6 +36,7 @@ uniform sampler2D TextureImage0;
 uniform sampler2D TextureImage1;
 uniform sampler2D TextureImage2;
 uniform sampler2D TextureImage3; // textura do ladrão
+uniform sampler2D TextureImage4; // textura dos esqueletos
 uniform vec3 light_positions[8];
 uniform vec3 light_colors[8];
 uniform int light_count;
@@ -147,6 +149,10 @@ void main()
     {
         Kd0 = texture(TextureImage3, texcoords).rgb;
     }
+    else if ( object_id == SKELETON )
+    {
+        Kd0 = texture(TextureImage4, texcoords).rgb;
+    }
 
     vec3 surface_normal = normalize(normal.xyz);
     vec3 view_direction = normalize(camera_position.xyz - p.xyz);
@@ -169,6 +175,11 @@ void main()
 
         lighting += attenuation * (diffuse + specular);
     }
+
+    // Os esqueletos têm um leve brilho próprio (aura de morto-vivo), para
+    // continuarem visíveis nas partes escuras da masmorra.
+    if ( object_id == SKELETON )
+        lighting += 0.18 * Kd0;
 
     color.rgb = lighting;
 

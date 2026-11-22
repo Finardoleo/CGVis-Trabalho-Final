@@ -50,6 +50,7 @@
 #include "utils.h"
 #include "matrices.h"
 #include "collisions.h"
+#include "bezier.h"
 
 // Estrutura que representa um modelo geométrico carregado a partir de um
 // arquivo ".obj". Veja https://en.wikipedia.org/wiki/Wavefront_.obj_file .
@@ -213,6 +214,18 @@ const float CAMERA_SMOOTHING    = 10.0f;  // maior = acompanha mais rápido
 const float PLAYER_TURN_SPEED   = 2.2f;   // giro pelas setas (rad/s)
 const float MOUSE_TURN_SENSITIVITY = 0.006f;
 
+// Rotação extra da câmera em torno do jogador (0 = atrás dele). A tecla Q
+// leva para PI (câmera na frente, vendo o rosto e o que vem atrás); arrastar
+// com o botão direito gira livremente. Ao soltar, volta suavemente para 0.
+float g_CameraYawOffset       = 0.0f;
+float g_CameraYawOffsetManual = 0.0f;
+bool  g_LookBack              = false;
+
+// Zoom da câmera de mapa (altura acima do jogador), controlado pela roda.
+float g_MapHeight = 30.0f;
+const float MAP_MIN_HEIGHT = 12.0f;
+const float MAP_MAX_HEIGHT = 80.0f;
+
 // Rotação extra aplicada só ao desenhar o modelo, para que a "frente" do
 // modelo .obj coincida com a direção para onde o jogador anda.
 const float PLAYER_MODEL_YAW_OFFSET = 0.0f; // o ladrão já olha para +Z
@@ -230,21 +243,23 @@ const float PLAYER_MODEL_SCALE  = 0.72f; // o modelo do ladrão tem 2.24 de altu
 //   '#' parede        '.' chão          'S' início do jogador
 //   'E' saída         'c' caixote (dá para se esconder agachado)
 //   'b' barril        'B' baú           'K' chave      '$' tesouro
+//   'G' portão da sala do tesouro (abre com as chaves)
+//   'Z' cajado mágico (o prêmio da sala do tesouro)
 const float CELL_SIZE = 4.0f;
 const char* DUNGEON_MAP[] = {
-    "#################",
-    "#S..#.....#.....#",
-    "###.#.###.#.###.#",
-    "#...#...#...#...#",
-    "#.#####.#####.###",
-    "#.#.........#...#",
-    "#.#..c.$.c..#.#.#",
-    "#.#....K....#.#.#",
-    "#...b.......###.#",
-    "####.####.#.....#",
-    "#..c.#B..b#.###.#",
-    "#K#.....#.#..$E.#",
-    "#################",
+    "#####################",
+    "#S..#.....#....K#####",
+    "###.#.###.#.###.#####",
+    "#...#...#...#...#...#",
+    "#.#####.#####.###$.$#",
+    "#.#.........#...G..E#",
+    "#.#..c.$.c..#.#.#.Z.#",
+    "#.#....K....#.#.#$.$#",
+    "#...b.......###.#####",
+    "####.####.#.....#####",
+    "#..c.#B..b#.###.#####",
+    "#K#.....#.#..$..#####",
+    "#####################",
 };
 const int MAP_ROWS = sizeof(DUNGEON_MAP) / sizeof(DUNGEON_MAP[0]);
 int MapCols() { return (int)strlen(DUNGEON_MAP[0]); }
@@ -257,9 +272,43 @@ char MapAt(int row, int col)
 glm::vec3 CellCenter(int row, int col) { return glm::vec3(col * CELL_SIZE, 0.0f, row * CELL_SIZE); }
 
 // Névoa: a cor final se mistura com a cor do fundo conforme a distância.
-const float FOG_DENSITY = 0.055f;
+const float FOG_DENSITY = 0.045f;
 const glm::vec3 FOG_COLOR(0.02f, 0.02f, 0.03f);
 
+// ---------------------------------------------------------------------------
+// Esqueletos
+// ---------------------------------------------------------------------------
+// Dois tipos:
+//  - PATRULHEIRO: anda por uma rota formada por curvas de Bézier cúbicas que
+//    passam pelos pontos de ronda (veja bezier.h). A rota pode ser fechada
+//    (anda em círculo) ou aberta (vai e volta).
+//  - SENTINELA: fica parado num ponto, girando o corpo de um lado para o
+//    outro (yaw = base + amplitude * sin(velocidade * t)).
+enum SkeletonType { PATROL, SENTINEL };
+
+struct Skeleton
+{
+    SkeletonType type;
+    glm::vec3 pos;
+    float yaw;
+
+    // Patrulheiro
+    std::vector<CubicBezier> path;
+    bool  closed;
+    float u;          // posição na rota: parte inteira = trecho, fração = t
+    float direction;  // +1 ou -1 (rotas abertas invertem nas pontas)
+    float speed;      // unidades por segundo
+
+    // Sentinela
+    float base_yaw, sweep_amplitude, sweep_speed, phase;
+};
+std::vector<Skeleton> g_Skeletons;
+
+const float SKELETON_MODEL_SCALE = 0.72f;
+const float PATROL_SPEED = 2.4f;
+
+void BuildSkeletons();
+void UpdateSkeletons(float delta_t, float time);
 void BuildDungeon();
 bool PlayerCollides(glm::vec3 feet_position);
 bool RayHitsColliders(glm::vec3 origin, glm::vec3 dir, float max_t, float& t_hit);
@@ -409,12 +458,13 @@ int main(int argc, char* argv[])
     {
         LoadTextureImage("../../data/kaykit_dungeon/dungeon_texture.png");    // TextureImage2
         LoadTextureImage("../../data/kaykit_characters/rogue_texture.png");   // TextureImage3
+        LoadTextureImage("../../data/kaykit_characters/skeleton_texture.png");// TextureImage4
 
         // Todas as malhas da masmorra usam a mesma textura (TextureImage2).
         const char* dungeon_models[] = {
             "floor_tile_large", "wall", "chest", "torch_mounted", "box_large",
             "crates_stacked", "barrel_small", "pillar", "coin_stack_large", "key",
-            "wall_doorway", "wall_doorway_door",
+            "wall_doorway", "wall_doorway_door", "wall_gated",
         };
         for (const char* name : dungeon_models)
         {
@@ -429,10 +479,20 @@ int main(int argc, char* argv[])
         ComputeNormals(&player_model);
         BuildTrianglesAndAddToVirtualScene(&player_model);
 
-        BuildDungeon();
+        // Esqueletos: patrulheiro (capuz) e sentinela (capacete com chifres).
+        ObjModel skeleton_model("../../data/kaykit_characters/skeleton.obj");
+        ComputeNormals(&skeleton_model);
+        BuildTrianglesAndAddToVirtualScene(&skeleton_model);
 
-        g_CameraDistance = 4.5f;
-        g_CameraPhi = 0.40f;
+        ObjModel warrior_model("../../data/kaykit_characters/skeleton_warrior.obj");
+        ComputeNormals(&warrior_model);
+        BuildTrianglesAndAddToVirtualScene(&warrior_model);
+
+        BuildDungeon();
+        BuildSkeletons();
+
+        g_CameraDistance = 5.5f;
+        g_CameraPhi = 0.50f;
     }
     else
     {
@@ -486,7 +546,10 @@ int main(int argc, char* argv[])
             delta_t = 0.1f;
 
         if (dungeon_preview)
+        {
             UpdatePlayer(window, delta_t);
+            UpdateSkeletons(delta_t, current_time);
+        }
 
         // Aqui executamos as operações de renderização
 
@@ -539,7 +602,7 @@ int main(int argc, char* argv[])
                 // ser Y; usamos -Z (o "topo" do mapa é o norte da masmorra).
                 // Ela acompanha o jogador, para funcionar em todo o labirinto.
                 camera_lookat_l   = glm::vec4(g_PlayerPos.x, 0.0f, g_PlayerPos.z, 1.0f);
-                camera_position_c = glm::vec4(g_PlayerPos.x, 30.0f, g_PlayerPos.z, 1.0f);
+                camera_position_c = glm::vec4(g_PlayerPos.x, g_MapHeight, g_PlayerPos.z, 1.0f);
                 camera_up_vector  = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
             }
             else
@@ -551,7 +614,14 @@ int main(int argc, char* argv[])
                 // ângulo phi: back = -forward*cos(phi) + up*sin(phi).
                 const glm::vec3 forward(sin(g_PlayerYaw), 0.0f, cos(g_PlayerYaw));
                 const glm::vec3 up(0.0f, 1.0f, 0.0f);
-                const glm::vec3 back = -forward*cosf(g_CameraPhi) + up*sinf(g_CameraPhi);
+
+                // O ângulo extra (olhar para trás / girar com botão direito)
+                // também é suavizado, para a câmera dar a volta em arco.
+                const float offset_target = g_LookBack ? 3.141592f : g_CameraYawOffsetManual;
+                g_CameraYawOffset += (offset_target - g_CameraYawOffset) * (1.0f - expf(-8.0f * delta_t));
+                const float cam_yaw = g_PlayerYaw + g_CameraYawOffset;
+                const glm::vec3 cam_forward(sin(cam_yaw), 0.0f, cos(cam_yaw));
+                const glm::vec3 back = -cam_forward*cosf(g_CameraPhi) + up*sinf(g_CameraPhi);
 
                 // Ponto de referência: a cabeça do jogador (mais baixa se agachado).
                 const glm::vec3 head = g_PlayerPos + glm::vec3(0.0f, g_PlayerCrouching ? 1.0f : 1.45f, 0.0f);
@@ -584,7 +654,7 @@ int main(int argc, char* argv[])
 
                 // A câmera olha um pouco à frente do jogador, assim ele fica na
                 // parte de baixo da tela e enxergamos o caminho adiante.
-                const glm::vec3 look = head + forward * 1.5f;
+                const glm::vec3 look = head + cam_forward * 2.0f;
 
                 camera_position_c = glm::vec4(cam, 1.0f);
                 camera_lookat_l   = glm::vec4(look, 1.0f);
@@ -685,6 +755,7 @@ int main(int argc, char* argv[])
         #define PLANE  2
         #define DUNGEON_OBJECT 3
         #define ROGUE 4
+        #define SKELETON 5
 
         if (dungeon_preview)
         {
@@ -709,6 +780,20 @@ int main(int argc, char* argv[])
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
             glUniform1i(g_object_id_uniform, ROGUE);
             DrawVirtualObject("rogue");
+
+            // Esqueletos: mesma ideia (T * R * S). Os patrulheiros "balançam"
+            // um pouco para cima e para baixo ao andar.
+            glUniform1i(g_object_id_uniform, SKELETON);
+            for (const Skeleton& sk : g_Skeletons)
+            {
+                const float bob = (sk.type == PATROL) ? 0.06f * fabsf(sinf(current_time * 6.0f + sk.phase)) : 0.0f;
+                const float ks = SKELETON_MODEL_SCALE;
+                model = Matrix_Translate(sk.pos.x, 0.05f + bob, sk.pos.z)
+                      * Matrix_Rotate_Y(sk.yaw)
+                      * Matrix_Scale(ks, ks, ks);
+                glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
+                DrawVirtualObject(sk.type == PATROL ? "skeleton" : "skeleton_warrior");
+            }
         }
         else
         {
@@ -744,7 +829,7 @@ int main(int argc, char* argv[])
                     "WASD: mover | setas ou botao esq. + mouse: virar | roda: zoom",
                     -1.0f + pad/10, 1.0f - pad, 1.0f);
                 TextRendering_PrintString(window,
-                    "C: agachar | M: mapa | H: ocultar ajuda",
+                    "C: agachar | Q: olhar para tras | botao dir.: girar camera | M: mapa | H: ocultar",
                     -1.0f + pad/10, 1.0f - 2*pad, 1.0f);
                 TextRendering_PrintString(window,
                     g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
@@ -927,6 +1012,7 @@ void LoadShadersFromFiles()
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage1"), 1);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage2"), 2);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage3"), 3);
+    glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage4"), 4);
     glUseProgram(0);
 }
 
@@ -1426,6 +1512,7 @@ void MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
         // Quando o usuário soltar o botão esquerdo do mouse, atualizamos a
         // variável abaixo para false.
         g_RightMouseButtonPressed = false;
+        g_CameraYawOffsetManual = 0.0f; // a câmera volta para trás do jogador
     }
     if (button == GLFW_MOUSE_BUTTON_MIDDLE && action == GLFW_PRESS)
     {
@@ -1496,7 +1583,14 @@ void CursorPosCallback(GLFWwindow* window, double xpos, double ypos)
         g_LastCursorPosY = ypos;
     }
 
-    if (g_RightMouseButtonPressed)
+    if (g_RightMouseButtonPressed && g_DungeonMode)
+    {
+        float dx = xpos - g_LastCursorPosX;
+        g_CameraYawOffsetManual -= MOUSE_TURN_SENSITIVITY * dx;
+        g_LastCursorPosX = xpos;
+        g_LastCursorPosY = ypos;
+    }
+    else if (g_RightMouseButtonPressed)
     {
         // Deslocamento do cursor do mouse em x e y de coordenadas de tela!
         float dx = xpos - g_LastCursorPosX;
@@ -1532,9 +1626,16 @@ void CursorPosCallback(GLFWwindow* window, double xpos, double ypos)
 // Função callback chamada sempre que o usuário movimenta a "rodinha" do mouse.
 void ScrollCallback(GLFWwindow* window, double xoffset, double yoffset)
 {
+    // Na câmera de mapa, a roda controla a altura (zoom do mapa).
+    if (g_DungeonMode && g_TopDownCamera)
+    {
+        g_MapHeight = std::max(MAP_MIN_HEIGHT, std::min(MAP_MAX_HEIGHT, g_MapHeight - 3.0f*(float)yoffset));
+        return;
+    }
+
     // Atualizamos a distância da câmera para a origem utilizando a
     // movimentação da "rodinha", simulando um ZOOM.
-    g_CameraDistance -= 0.1f*yoffset;
+    g_CameraDistance -= 0.3f*yoffset;
 
     // Uma câmera look-at nunca pode estar exatamente "em cima" do ponto para
     // onde ela está olhando, pois isto gera problemas de divisão por zero na
@@ -2029,7 +2130,7 @@ void BuildDungeon()
         // Tochas: em algumas células (padrão fixo, para ficarem espalhadas),
         // presas na primeira parede vizinha. Cada tocha gera uma luz pontual,
         // um pouco à frente e acima dela (onde fica a chama).
-        if (wall_count > 0 && cell != 'E' && (r * 7 + c * 3) % 4 == 0)
+        if (wall_count > 0 && cell != 'E' && cell != 'G' && (r * 7 + c * 3) % 4 == 0)
         {
             for (const Neighbor& nb : neighbors)
             {
@@ -2070,6 +2171,14 @@ void BuildDungeon()
             // Chave flutuando (a lógica de coletar vem numa próxima parte).
             add("key_Torus.035", at_center * Matrix_Translate(-0.25f, 1.0f, 0.0f) * Matrix_Rotate_Z(PI_2), false);
             break;
+        case 'G':
+        {
+            // Portão da sala do tesouro: grade atravessando o corredor (que
+            // vai na direção X), por isso girado 90 graus. Por enquanto fica
+            // sempre fechado (é uma caixa de colisão).
+            add("wall_gated_Cube.13125", at_center * Matrix_Rotate_Y(PI_2), true);
+            break;
+        }
         case 'E':
             // Saída: um portal com porta na parede vizinha.
             for (const Neighbor& nb : neighbors)
@@ -2084,6 +2193,125 @@ void BuildDungeon()
             }
             break;
         }
+    }
+}
+
+// Cria os esqueletos. As rotas são dadas por células do mapa (linha, coluna);
+// os centros dessas células são os pontos de passagem da curva de Bézier.
+void BuildSkeletons()
+{
+    struct PatrolDef { bool closed; std::vector<glm::ivec2> cells; };
+    const PatrolDef patrols[] = {
+        // Sala central: volta completa pela sala (rota fechada).
+        { true,  { {5, 3}, {5, 11}, {8, 11}, {8, 6} } },
+        // Corredor do canto superior direito, perto de uma chave (vai e volta).
+        { false, { {1, 11}, {1, 15}, {3, 15}, {3, 13} } },
+        // Laço de corredores no canto inferior direito (rota fechada).
+        { true,  { {9, 11}, {9, 15}, {11, 15}, {11, 11} } },
+    };
+
+    int index = 0;
+    for (const PatrolDef& def : patrols)
+    {
+        std::vector<glm::vec3> points;
+        for (const glm::ivec2& cell : def.cells)
+            points.push_back(CellCenter(cell.x, cell.y));
+
+        Skeleton sk;
+        sk.type      = PATROL;
+        sk.path      = BuildBezierPath(points, def.closed);
+        sk.closed    = def.closed;
+        sk.u         = 0.0f;
+        sk.direction = 1.0f;
+        sk.speed     = PATROL_SPEED;
+        sk.pos       = points[0];
+        sk.yaw       = 0.0f;
+        sk.base_yaw = sk.sweep_amplitude = sk.sweep_speed = 0.0f;
+        sk.phase     = 1.3f * index++;
+        g_Skeletons.push_back(sk);
+    }
+
+    // Sentinelas: bloqueiam um corredor, girando de um lado para o outro.
+    struct SentinelDef { int row, col; float base_yaw, amplitude, speed; };
+    const float PI_2 = 1.570796f;
+    const SentinelDef sentinels[] = {
+        // Guarda a chave do canto inferior esquerdo (olha de leste a sul).
+        { 10, 2, PI_2 * 0.5f, PI_2 * 0.5f, 0.9f },
+        // Bloqueia o corredor que leva ao baú (olha de norte a sul, passando
+        // pela parede): é preciso achar o outro caminho até o baú.
+        { 9, 9, PI_2, PI_2, 0.7f },
+    };
+    for (const SentinelDef& def : sentinels)
+    {
+        Skeleton sk;
+        sk.type            = SENTINEL;
+        sk.pos             = CellCenter(def.row, def.col);
+        sk.base_yaw        = def.base_yaw;
+        sk.sweep_amplitude = def.amplitude;
+        sk.sweep_speed     = def.speed;
+        sk.phase           = 1.3f * index++;
+        sk.yaw             = def.base_yaw;
+        sk.closed = false; sk.u = 0.0f; sk.direction = 1.0f; sk.speed = 0.0f;
+        g_Skeletons.push_back(sk);
+    }
+}
+
+// Gira 'current' em direção a 'target' (ângulos em radianos) pelo caminho
+// mais curto, no máximo 'max_step' radianos.
+static float TurnTowards(float current, float target, float max_step)
+{
+    float diff = target - current;
+    while (diff >  3.141592f) diff -= 2.0f * 3.141592f;
+    while (diff < -3.141592f) diff += 2.0f * 3.141592f;
+    if (diff >  max_step) diff =  max_step;
+    if (diff < -max_step) diff = -max_step;
+    return current + diff;
+}
+
+// Atualiza a posição e a direção de todos os esqueletos (proporcional a delta_t).
+void UpdateSkeletons(float delta_t, float time)
+{
+    for (Skeleton& sk : g_Skeletons)
+    {
+        if (sk.type == SENTINEL)
+        {
+            sk.yaw = sk.base_yaw + sk.sweep_amplitude * sinf(sk.sweep_speed * time + sk.phase);
+            continue;
+        }
+
+        const int segments = (int)sk.path.size();
+
+        // Avançamos o parâmetro u de forma que a distância percorrida seja
+        // speed * delta_t: como |B'(t)| é a "velocidade" da curva, o passo em
+        // t é distância / |B'(t)|. Assim o esqueleto anda com velocidade
+        // constante, mesmo nos trechos onde a curva é mais "esticada".
+        int   seg = std::min((int)sk.u, segments - 1);
+        float t   = sk.u - seg;
+        const float curve_speed = std::max(glm::length(sk.path[seg].Tangent(t)), 0.01f);
+        sk.u += sk.direction * (sk.speed * delta_t) / curve_speed;
+
+        if (sk.closed)
+        {
+            // Rota fechada: dá a volta.
+            while (sk.u >= segments) sk.u -= segments;
+            while (sk.u < 0.0f)      sk.u += segments;
+        }
+        else
+        {
+            // Rota aberta: inverte o sentido nas pontas (vai e volta).
+            if (sk.u >= segments) { sk.u = 2.0f*segments - sk.u; sk.direction = -1.0f; }
+            if (sk.u < 0.0f)      { sk.u = -sk.u;                 sk.direction =  1.0f; }
+        }
+
+        seg = std::min((int)sk.u, segments - 1);
+        t   = sk.u - seg;
+        sk.pos = sk.path[seg].Point(t);
+
+        // O esqueleto olha na direção em que anda (tangente da curva), virando
+        // aos poucos para não "estalar" nas inversões.
+        const glm::vec3 dir = sk.path[seg].Tangent(t) * sk.direction;
+        if (glm::length(dir) > 1e-4f)
+            sk.yaw = TurnTowards(sk.yaw, atan2f(dir.x, dir.z), 4.0f * delta_t);
     }
 }
 
@@ -2140,6 +2368,7 @@ void UpdatePlayer(GLFWwindow* window, float delta_t)
     if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) direction -= right;
 
     g_PlayerCrouching = (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS);
+    g_LookBack        = (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
 
     if (glm::length(direction) < 1e-5f)
         return;
