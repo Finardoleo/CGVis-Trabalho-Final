@@ -194,6 +194,7 @@ struct Instance
 std::vector<Instance>  g_Instances;   // Tudo que é desenhado na masmorra
 std::vector<AABB>      g_Colliders;   // Caixas de colisão (paredes, baús)
 std::vector<glm::vec3> g_TorchLights; // Posição da luz de cada tocha
+glm::vec3 g_StaffPos = glm::vec3(0.0f);   // Onde flutua o cajado mágico (prêmio)
 
 glm::vec3 g_PlayerPos = glm::vec3(0.0f, 0.0f, -3.0f); // Pés do jogador
 float g_PlayerYaw     = 0.0f;                         // Rotação em Y
@@ -221,8 +222,11 @@ float g_CameraYawOffset       = 0.0f;
 float g_CameraYawOffsetManual = 0.0f;
 bool  g_LookBack              = false;
 
-// Zoom da câmera de mapa (altura acima do jogador), controlado pela roda.
+// Zoom da câmera de mapa (altura acima do jogador), controlado pela roda, e
+// deslocamento do mapa ao arrastar com o botão esquerdo (volta a zero ao
+// abrir o mapa de novo).
 float g_MapHeight = 30.0f;
+glm::vec2 g_MapPan = glm::vec2(0.0f);
 const float MAP_MIN_HEIGHT = 12.0f;
 const float MAP_MAX_HEIGHT = 80.0f;
 
@@ -245,21 +249,31 @@ const float PLAYER_MODEL_SCALE  = 0.72f; // o modelo do ladrão tem 2.24 de altu
 //   'b' barril        'B' baú           'K' chave      '$' tesouro
 //   'G' portão da sala do tesouro (abre com as chaves)
 //   'Z' cajado mágico (o prêmio da sala do tesouro)
+//   'P' pilar decorado
+// A sala do tesouro fica no centro (linhas 7..11, colunas 9..13) e tem uma
+// decoração diferente: piso de madeira escura, estandartes verdes, ouro e a
+// luz verde do cajado.
 const float CELL_SIZE = 4.0f;
 const char* DUNGEON_MAP[] = {
-    "#####################",
-    "#S..#.....#....K#####",
-    "###.#.###.#.###.#####",
-    "#...#...#...#...#...#",
-    "#.#####.#####.###$.$#",
-    "#.#.........#...G..E#",
-    "#.#..c.$.c..#.#.#.Z.#",
-    "#.#....K....#.#.#$.$#",
-    "#...b.......###.#####",
-    "####.####.#.....#####",
-    "#..c.#B..b#.###.#####",
-    "#K#.....#.#..$..#####",
-    "#####################",
+    "#######################",
+    "#S#.......#$.........K#",
+    "#.#.#####.###.#######.#",
+    "#.#...#$............#.#",
+    "#.#...#########.#...#.#",
+    "#.....#..c...c..#...#.#",
+    "###.###.#######.#.#.#.#",
+    "#b...B#.#$.E.$#.#...#.#",
+    "#.#.###.#.P.P.#.#.###.#",
+    "#.#b..#c#..Z..#c#...#.#",
+    "#.###.#.#.P.P.#.#.#.#.#",
+    "#.....#.#$...$#.#...#.#",
+    "#.#####.###G###.#.###.#",
+    "#.#......c...c..#.....#",
+    "#.#...###########...#.#",
+    "#.............#.......#",
+    "#.###########.#.###.#.#",
+    "#K.........$#........K#",
+    "#######################",
 };
 const int MAP_ROWS = sizeof(DUNGEON_MAP) / sizeof(DUNGEON_MAP[0]);
 int MapCols() { return (int)strlen(DUNGEON_MAP[0]); }
@@ -268,6 +282,8 @@ char MapAt(int row, int col)
     if (row < 0 || row >= MAP_ROWS || col < 0 || col >= MapCols()) return '#';
     return DUNGEON_MAP[row][col];
 }
+bool IsTreasureRoom(int row, int col) { return row >= 7 && row <= 11 && col >= 9 && col <= 13; }
+
 // Centro da célula (row, col) no mundo.
 glm::vec3 CellCenter(int row, int col) { return glm::vec3(col * CELL_SIZE, 0.0f, row * CELL_SIZE); }
 
@@ -459,12 +475,15 @@ int main(int argc, char* argv[])
         LoadTextureImage("../../data/kaykit_dungeon/dungeon_texture.png");    // TextureImage2
         LoadTextureImage("../../data/kaykit_characters/rogue_texture.png");   // TextureImage3
         LoadTextureImage("../../data/kaykit_characters/skeleton_texture.png");// TextureImage4
+        LoadTextureImage("../../data/kaykit_characters/mage_texture.png");    // TextureImage5 (cajado)
 
         // Todas as malhas da masmorra usam a mesma textura (TextureImage2).
         const char* dungeon_models[] = {
             "floor_tile_large", "wall", "chest", "torch_mounted", "box_large",
-            "crates_stacked", "barrel_small", "pillar", "coin_stack_large", "key",
+            "crates_stacked", "barrel_small", "coin_stack_large", "key",
             "wall_doorway", "wall_doorway_door", "wall_gated",
+            "floor_wood_large_dark", "pillar_decorated", "banner_patternA_green",
+            "banner_thin_green", "chest_gold", "candle_triple", "column",
         };
         for (const char* name : dungeon_models)
         {
@@ -487,6 +506,11 @@ int main(int argc, char* argv[])
         ObjModel warrior_model("../../data/kaykit_characters/skeleton_warrior.obj");
         ComputeNormals(&warrior_model);
         BuildTrianglesAndAddToVirtualScene(&warrior_model);
+
+        // O cajado mágico (prêmio da sala do tesouro).
+        ObjModel staff_model("../../data/kaykit_characters/staff.obj");
+        ComputeNormals(&staff_model);
+        BuildTrianglesAndAddToVirtualScene(&staff_model);
 
         BuildDungeon();
         BuildSkeletons();
@@ -601,8 +625,10 @@ int main(int argc, char* argv[])
                 // direção de visão é paralela ao eixo Y, o vetor "up" não pode
                 // ser Y; usamos -Z (o "topo" do mapa é o norte da masmorra).
                 // Ela acompanha o jogador, para funcionar em todo o labirinto.
-                camera_lookat_l   = glm::vec4(g_PlayerPos.x, 0.0f, g_PlayerPos.z, 1.0f);
-                camera_position_c = glm::vec4(g_PlayerPos.x, g_MapHeight, g_PlayerPos.z, 1.0f);
+                const float map_x = g_PlayerPos.x + g_MapPan.x;
+                const float map_z = g_PlayerPos.z + g_MapPan.y;
+                camera_lookat_l   = glm::vec4(map_x, 0.0f, map_z, 1.0f);
+                camera_position_c = glm::vec4(map_x, g_MapHeight, map_z, 1.0f);
                 camera_up_vector  = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
             }
             else
@@ -713,24 +739,36 @@ int main(int argc, char* argv[])
             // O shader aceita até 8 luzes; usamos as 8 tochas mais próximas
             // do jogador (as distantes quase não contribuem, por causa da
             // atenuação e da névoa).
-            std::vector<int> order(g_TorchLights.size());
-            for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
-            std::sort(order.begin(), order.end(), [](int a, int b) {
-                return glm::length(g_TorchLights[a] - g_PlayerPos) < glm::length(g_TorchLights[b] - g_PlayerPos);
+            // Candidatas: todas as tochas (laranja, tremulando) e o cajado
+            // (verde, pulsando). O índice -1 representa o cajado.
+            std::vector<int> order;
+            for (size_t i = 0; i < g_TorchLights.size(); ++i) order.push_back((int)i);
+            order.push_back(-1);
+            auto light_pos = [](int i) { return i < 0 ? g_StaffPos + glm::vec3(0.0f, 1.0f, 0.0f) : g_TorchLights[i]; };
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return glm::length(light_pos(a) - g_PlayerPos) < glm::length(light_pos(b) - g_PlayerPos);
             });
 
             for (size_t k = 0; k < order.size() && k < 8; ++k)
             {
                 const int i = order[k];
-                // Tremulação do fogo: intensidade varia com o tempo (cada
-                // tocha com uma fase diferente).
-                const float flicker = 0.85f + 0.15f * sinf(current_time*9.0f + i*1.7f) * sinf(current_time*3.7f + i*0.6f);
-                light_positions[k][0] = g_TorchLights[i].x;
-                light_positions[k][1] = g_TorchLights[i].y;
-                light_positions[k][2] = g_TorchLights[i].z;
-                light_colors[k][0] = 3.2f * flicker; // cor quente de fogo
-                light_colors[k][1] = 1.5f * flicker;
-                light_colors[k][2] = 0.55f * flicker;
+                const glm::vec3 lp = light_pos(i);
+                glm::vec3 color;
+                if (i < 0)
+                {
+                    // Luz mágica do cajado: verde e intensa, pulsando devagar.
+                    const float pulse = 0.8f + 0.2f * sinf(current_time * 2.0f);
+                    color = glm::vec3(0.8f, 4.5f, 1.6f) * pulse;
+                }
+                else
+                {
+                    // Tremulação do fogo: intensidade varia com o tempo (cada
+                    // tocha com uma fase diferente).
+                    const float flicker = 0.85f + 0.15f * sinf(current_time*9.0f + i*1.7f) * sinf(current_time*3.7f + i*0.6f);
+                    color = glm::vec3(3.2f, 1.5f, 0.55f) * flicker; // cor quente de fogo
+                }
+                light_positions[k][0] = lp.x; light_positions[k][1] = lp.y; light_positions[k][2] = lp.z;
+                light_colors[k][0] = color.x; light_colors[k][1] = color.y; light_colors[k][2] = color.z;
                 ++light_count;
             }
         }
@@ -756,6 +794,7 @@ int main(int argc, char* argv[])
         #define DUNGEON_OBJECT 3
         #define ROGUE 4
         #define SKELETON 5
+        #define STAFF 6
 
         if (dungeon_preview)
         {
@@ -794,6 +833,15 @@ int main(int argc, char* argv[])
                 glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
                 DrawVirtualObject(sk.type == PATROL ? "skeleton" : "skeleton_warrior");
             }
+
+            // Cajado mágico: flutua (sobe e desce) e gira em torno de Y.
+            model = Matrix_Translate(g_StaffPos.x, g_StaffPos.y + 0.15f * sinf(current_time * 1.5f), g_StaffPos.z)
+                  * Matrix_Rotate_Y(current_time * 0.8f)
+                  * Matrix_Rotate_Z(0.25f)
+                  * Matrix_Scale(0.9f, 0.9f, 0.9f);
+            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
+            glUniform1i(g_object_id_uniform, STAFF);
+            DrawVirtualObject("staff");
         }
         else
         {
@@ -829,7 +877,7 @@ int main(int argc, char* argv[])
                     "WASD: mover | setas ou botao esq. + mouse: virar | roda: zoom",
                     -1.0f + pad/10, 1.0f - pad, 1.0f);
                 TextRendering_PrintString(window,
-                    "C: agachar | Q: olhar para tras | botao dir.: girar camera | M: mapa | H: ocultar",
+                    "C: agachar | Q: olhar para tras | botao dir.: girar camera | M: mapa (roda: zoom, arrastar: mover) | H: ocultar",
                     -1.0f + pad/10, 1.0f - 2*pad, 1.0f);
                 TextRendering_PrintString(window,
                     g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
@@ -1013,6 +1061,7 @@ void LoadShadersFromFiles()
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage2"), 2);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage3"), 3);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage4"), 4);
+    glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage5"), 5);
     glUseProgram(0);
 }
 
@@ -1542,7 +1591,21 @@ void CursorPosCallback(GLFWwindow* window, double xpos, double ypos)
     // parâmetros que definem a posição da câmera dentro da cena virtual.
     // Assim, temos que o usuário consegue controlar a câmera.
 
-    if (g_LeftMouseButtonPressed && g_DungeonMode)
+    if (g_LeftMouseButtonPressed && g_DungeonMode && g_TopDownCamera)
+    {
+        // Arrastar o mapa: o mundo acompanha o mouse. Um pixel na tela
+        // corresponde a 2*h*tan(fov/2)/altura_da_janela unidades no chão
+        // (fov = 60 graus). Na câmera de mapa, a direita da tela é +X e o
+        // "para baixo" da tela é +Z.
+        int width, height;
+        glfwGetWindowSize(window, &width, &height);
+        const float units_per_pixel = 2.0f * g_MapHeight * tanf(3.141592f / 6.0f) / std::max(height, 1);
+        g_MapPan.x -= (float)(xpos - g_LastCursorPosX) * units_per_pixel;
+        g_MapPan.y -= (float)(ypos - g_LastCursorPosY) * units_per_pixel;
+        g_LastCursorPosX = xpos;
+        g_LastCursorPosY = ypos;
+    }
+    else if (g_LeftMouseButtonPressed && g_DungeonMode)
     {
         // Na masmorra, arrastar o mouse na horizontal vira o jogador (e a
         // câmera, que está sempre às costas dele); na vertical, sobe/desce a
@@ -1720,6 +1783,7 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mod)
     if (key == GLFW_KEY_M && action == GLFW_PRESS)
     {
         g_TopDownCamera = !g_TopDownCamera;
+        g_MapPan = glm::vec2(0.0f); // o mapa abre centrado no jogador
     }
 
     // Se o usuário apertar a tecla H, fazemos um "toggle" do texto informativo mostrado na tela.
@@ -2104,8 +2168,11 @@ void BuildDungeon()
             continue;
         }
 
-        // Chão.
-        add("floor_tile_large_Cube.13698", Matrix_Translate(center.x, 0.0f, center.z), false);
+        const bool treasure_room = IsTreasureRoom(r, c);
+
+        // Chão (na sala do tesouro, de madeira escura).
+        add(treasure_room ? "floor_wood_large_dark_Cube.159" : "floor_tile_large_Cube.13698",
+            Matrix_Translate(center.x, 0.0f, center.z), false);
 
         // Paredes: para cada vizinho que é parede, um painel (4 de largura,
         // 1 de espessura) na borda entre as duas células, com a espessura
@@ -2125,12 +2192,19 @@ void BuildDungeon()
             const glm::vec3 p = center + to_wall * (half + 0.5f);
             const bool along_z = (nb.dc != 0);
             add("wall_Cube.13106", Matrix_Translate(p.x, 0.0f, p.z) * Matrix_Rotate_Y(along_z ? PI_2 : 0.0f), false);
+
+            // Na sala do tesouro, estandartes verdes alternados nas paredes. O
+            // modelo do estandarte já fica encostado na face +Z do painel, por
+            // isso usamos a mesma posição, virada para dentro da sala.
+            if (treasure_room && (r + c) % 2 == 0)
+                add((r + c) % 4 == 0 ? "banner_patternA_green_Cube.15678" : "banner_thin_green_Cube.15614",
+                    Matrix_Translate(p.x, 0.0f, p.z) * Matrix_Rotate_Y(nb.yaw_into_cell), false);
         }
 
         // Tochas: em algumas células (padrão fixo, para ficarem espalhadas),
         // presas na primeira parede vizinha. Cada tocha gera uma luz pontual,
         // um pouco à frente e acima dela (onde fica a chama).
-        if (wall_count > 0 && cell != 'E' && cell != 'G' && (r * 7 + c * 3) % 4 == 0)
+        if (wall_count > 0 && !treasure_room && cell != 'G' && (r * 7 + c * 3) % 4 == 0)
         {
             for (const Neighbor& nb : neighbors)
             {
@@ -2153,10 +2227,27 @@ void BuildDungeon()
             for (const Neighbor& nb : neighbors)
                 if (MapAt(r + nb.dr, c + nb.dc) != '#') { g_PlayerYaw = nb.yaw_into_cell + PI; break; }
             break;
-        case 'c': // caixotes: uma caixa grande e uma pilha, para se esconder
-            add("box_large_Cube.14519", at_center * Matrix_Translate(-0.6f, 0.0f, 0.4f), true);
-            add("crates_stacked_Cube.023", at_center * Matrix_Translate(0.9f, 0.0f, -0.7f) * Matrix_Rotate_Y(0.4f), true);
+        case 'c':
+        {
+            // Caixote para se esconder. Num corredor, fica encostado numa
+            // parede (para não bloquear a passagem); numa sala, uma caixa e
+            // uma pilha de caixotes.
+            bool placed = false;
+            for (const Neighbor& nb : neighbors)
+            {
+                if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
+                const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
+                add("box_large_Cube.14519", at_center * Matrix_Translate(to_wall.x*1.2f, 0.0f, to_wall.z*1.2f), true);
+                placed = true;
+                break;
+            }
+            if (!placed)
+            {
+                add("box_large_Cube.14519", at_center * Matrix_Translate(-0.6f, 0.0f, 0.4f), true);
+                add("crates_stacked_Cube.023", at_center * Matrix_Translate(0.9f, 0.0f, -0.7f) * Matrix_Rotate_Y(0.4f), true);
+            }
             break;
+        }
         case 'b':
             add("barrel_small_Cylinder.216", at_center * Matrix_Translate(-0.5f, 0.0f, 0.3f), true);
             add("barrel_small_Cylinder.216", at_center * Matrix_Translate(0.6f, 0.0f, -0.4f), true);
@@ -2165,18 +2256,43 @@ void BuildDungeon()
             add("chest_Cube.11164", at_center * Matrix_Rotate_Y(0.3f), true);
             break;
         case '$':
-            add("coin_stack_large_Cube.022", at_center * Matrix_Scale(0.7f, 0.7f, 0.7f), false);
+            if (treasure_room)
+            {
+                // Nos cantos da sala do tesouro: baú de ouro e moedas.
+                add("chest_gold_Cube.14744", at_center * Matrix_Rotate_Y((r + c) * 0.7f), true);
+                add("coin_stack_large_Cube.022", at_center * Matrix_Translate(1.0f, 0.0f, 0.9f) * Matrix_Scale(0.6f, 0.6f, 0.6f), false);
+            }
+            else
+                add("coin_stack_large_Cube.022", at_center * Matrix_Scale(0.7f, 0.7f, 0.7f), false);
             break;
+        case 'P':
+            add("pillar_decorated_Cube.005", at_center, true);
+            break;
+        case 'Z':
+        {
+            // Pedestal do cajado, com velas em volta. O cajado em si é
+            // desenhado à parte (gira e flutua) e emite uma luz verde.
+            add("column_Cube.13695", at_center, true);
+            for (int k = 0; k < 4; ++k)
+            {
+                const float a = PI_2 * k + 0.785f;
+                add("candle_triple_Cylinder.308", at_center * Matrix_Translate(1.6f*sinf(a), 0.0f, 1.6f*cosf(a)), false);
+            }
+            g_StaffPos = center + glm::vec3(0.0f, 1.5f, 0.0f);
+            break;
+        }
         case 'K':
             // Chave flutuando (a lógica de coletar vem numa próxima parte).
             add("key_Torus.035", at_center * Matrix_Translate(-0.25f, 1.0f, 0.0f) * Matrix_Rotate_Z(PI_2), false);
             break;
         case 'G':
         {
-            // Portão da sala do tesouro: grade atravessando o corredor (que
-            // vai na direção X), por isso girado 90 graus. Por enquanto fica
+            // Portão da sala do tesouro: grade atravessando o corredor. Se o
+            // corredor vai na direção Z (vizinhos norte/sul livres), a grade
+            // fica ao longo de X; senão, girada 90 graus. Por enquanto fica
             // sempre fechado (é uma caixa de colisão).
-            add("wall_gated_Cube.13125", at_center * Matrix_Rotate_Y(PI_2), true);
+            const bool corridor_along_z = MapAt(r - 1, c) != '#' && MapAt(r + 1, c) != '#';
+            add("wall_gated_Cube.13125", at_center * Matrix_Rotate_Y(corridor_along_z ? 0.0f : PI_2), true);
             break;
         }
         case 'E':
@@ -2202,20 +2318,40 @@ void BuildSkeletons()
 {
     struct PatrolDef { bool closed; std::vector<glm::ivec2> cells; };
     const PatrolDef patrols[] = {
-        // Sala central: volta completa pela sala (rota fechada).
-        { true,  { {5, 3}, {5, 11}, {8, 11}, {8, 6} } },
-        // Corredor do canto superior direito, perto de uma chave (vai e volta).
-        { false, { {1, 11}, {1, 15}, {3, 15}, {3, 13} } },
-        // Laço de corredores no canto inferior direito (rota fechada).
-        { true,  { {9, 11}, {9, 15}, {11, 15}, {11, 11} } },
+        // Dois esqueletos dando a volta no corredor em torno da sala do
+        // tesouro (a mesma rota fechada; o segundo começa do lado oposto).
+        { true,  { {5, 7}, {5, 15}, {13, 15}, {13, 7} } },
+        { true,  { {13, 15}, {13, 7}, {5, 7}, {5, 15} } },
+        // Corredores longos (vão e voltam).
+        { false, { {15, 1}, {15, 13} } },
+        { false, { {3, 8}, {3, 19} } },
+        { false, { {2, 21}, {16, 21} } },
     };
 
     int index = 0;
     for (const PatrolDef& def : patrols)
     {
+        // Os cantos da rota são ligados por linhas retas de células, e
+        // usamos o centro de CADA célula como ponto de passagem. Com pontos
+        // próximos, a curva só arredonda as esquinas dentro do corredor (com
+        // pontos muito distantes, as tangentes ficariam enormes e a curva
+        // "estufaria" atravessando as paredes).
+        std::vector<glm::ivec2> corners = def.cells;
+        if (def.closed) corners.push_back(def.cells[0]);
         std::vector<glm::vec3> points;
-        for (const glm::ivec2& cell : def.cells)
-            points.push_back(CellCenter(cell.x, cell.y));
+        points.push_back(CellCenter(corners[0].x, corners[0].y));
+        for (size_t k = 1; k < corners.size(); ++k)
+        {
+            glm::ivec2 cell = corners[k-1];
+            const glm::ivec2 step((corners[k].x > cell.x) - (corners[k].x < cell.x),
+                                  (corners[k].y > cell.y) - (corners[k].y < cell.y));
+            while (cell != corners[k])
+            {
+                cell += step;
+                points.push_back(CellCenter(cell.x, cell.y));
+            }
+        }
+        if (def.closed) points.pop_back(); // o último repetiria o primeiro
 
         Skeleton sk;
         sk.type      = PATROL;
@@ -2235,11 +2371,11 @@ void BuildSkeletons()
     struct SentinelDef { int row, col; float base_yaw, amplitude, speed; };
     const float PI_2 = 1.570796f;
     const SentinelDef sentinels[] = {
-        // Guarda a chave do canto inferior esquerdo (olha de leste a sul).
-        { 10, 2, PI_2 * 0.5f, PI_2 * 0.5f, 0.9f },
-        // Bloqueia o corredor que leva ao baú (olha de norte a sul, passando
-        // pela parede): é preciso achar o outro caminho até o baú.
-        { 9, 9, PI_2, PI_2, 0.7f },
+        // Um sentinela no meio de cada salinha perto das chaves, girando
+        // devagar e olhando para todos os lados.
+        { 4, 18,  0.0f, 2.0f * PI_2, 0.45f },
+        { 14, 4,  0.0f, 2.0f * PI_2, 0.40f },
+        { 14, 18, 0.0f, 2.0f * PI_2, 0.50f },
     };
     for (const SentinelDef& def : sentinels)
     {

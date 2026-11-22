@@ -6,3 +6,4 @@ KayKit Character Pack: Adventurers (Kay Lousberg, CC0): https://github.com/KayKi
   -> data/kaykit_characters/rogue.obj (convertido de Rogue_Hooded.glb para .obj na pose "Unarmed_Idle")
 KayKit Character Pack: Skeletons (Kay Lousberg, CC0): https://github.com/KayKit-Game-Assets/KayKit-Character-Pack-Skeletons-1.0
   -> data/kaykit_characters/skeleton.obj (Skeleton_Rogue, pose "Walking_A") e skeleton_warrior.obj (Skeleton_Warrior, pose "Idle_Combat")
+  -> data/kaykit_characters/staff.obj (cajado, convertido de staff.gltf) e mage_texture.png
