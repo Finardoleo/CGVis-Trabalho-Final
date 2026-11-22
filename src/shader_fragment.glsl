@@ -26,6 +26,7 @@ uniform mat4 projection;
 #define ROGUE 4
 #define SKELETON 5
 #define STAFF 6
+#define VISION_CONE 7
 uniform int object_id;
 
 // Parâmetros da axis-aligned bounding box (AABB) do modelo
@@ -48,6 +49,13 @@ uniform float ambient_strength;
 uniform float fog_density;
 uniform vec3  fog_color;
 
+// Cor (com transparência) do cone de visão dos esqueletos.
+uniform vec4 cone_color;
+
+// Tingimento da cena inteira (rgb = cor, a = quanto misturar). Usado para
+// deixar a tela avermelhada quando o jogador é capturado.
+uniform vec4 tint;
+
 // O valor de saída ("out") de um Fragment Shader é a cor final do fragmento.
 out vec4 color;
 
@@ -57,6 +65,13 @@ out vec4 color;
 
 void main()
 {
+    // O cone de visão não tem iluminação: só uma cor semitransparente.
+    if ( object_id == VISION_CONE )
+    {
+        color = cone_color;
+        return;
+    }
+
     // Obtemos a posição da câmera utilizando a inversa da matriz que define o
     // sistema de coordenadas da câmera.
     vec4 origin = vec4(0.0, 0.0, 0.0, 1.0);
@@ -218,4 +233,7 @@ void main()
     // Cor final com correção gamma, considerando monitor sRGB.
     // Veja https://en.wikipedia.org/w/index.php?title=Gamma_correction&oldid=751281772#Windows.2C_Mac.2C_sRGB_and_TV.2Fvideo_standard_gammas
     color.rgb = pow(color.rgb, vec3(1.0,1.0,1.0)/2.2);
+
+    // Tingimento (captura).
+    color.rgb = mix(color.rgb, tint.rgb, tint.a);
 } 

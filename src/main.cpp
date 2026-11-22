@@ -256,10 +256,10 @@ const float PLAYER_MODEL_SCALE  = 0.72f; // o modelo do ladrão tem 2.24 de altu
 const float CELL_SIZE = 4.0f;
 const char* DUNGEON_MAP[] = {
     "#######################",
-    "#S#.......#$.........K#",
+    "#S#.......#$.........$#",
     "#.#.#####.###.#######.#",
-    "#.#...#$............#.#",
-    "#.#...#########.#...#.#",
+    "#.#...#$...........K#.#",
+    "#.#...#########.#.c.#.#",
     "#.....#..c...c..#...#.#",
     "###.###.#######.#.#.#.#",
     "#b...B#.#$.E.$#.#...#.#",
@@ -268,11 +268,11 @@ const char* DUNGEON_MAP[] = {
     "#.###.#.#.P.P.#.#.#.#.#",
     "#.....#.#$...$#.#...#.#",
     "#.#####.###G###.#.###.#",
-    "#.#......c...c..#.....#",
-    "#.#...###########...#.#",
-    "#.............#.......#",
+    "#.#K.....c...c..#.....#",
+    "#.#.c.###########.c.#.#",
+    "#.............#....K..#",
     "#.###########.#.###.#.#",
-    "#K.........$#........K#",
+    "#$.........$#........$#",
     "#######################",
 };
 const int MAP_ROWS = sizeof(DUNGEON_MAP) / sizeof(DUNGEON_MAP[0]);
@@ -315,19 +315,61 @@ struct Skeleton
     float direction;  // +1 ou -1 (rotas abertas invertem nas pontas)
     float speed;      // unidades por segundo
 
-    // Sentinela
-    float base_yaw, sweep_amplitude, sweep_speed, phase;
+    // Sentinela (guarda): alterna entre olhar na direção A e na direção B,
+    // parando alguns segundos em cada uma.
+    float yaw_a, yaw_b, phase;
+
+    // Visão: true se o esqueleto está vendo o jogador neste quadro.
+    bool sees_player;
 };
 std::vector<Skeleton> g_Skeletons;
 
 const float SKELETON_MODEL_SCALE = 0.72f;
 const float PATROL_SPEED = 2.4f;
+const float GUARD_HOLD_TIME = 2.5f; // segundos olhando para cada lado
+const float GUARD_TURN_TIME = 0.8f; // segundos virando
+
+// Visão dos esqueletos: um cone com alcance e meia-abertura. Agachado, o
+// jogador só é notado mais de perto; escondido (Espaço), não é notado.
+const float VIEW_DISTANCE        = 10.0f;
+const float VIEW_DISTANCE_CROUCH = 6.0f;
+const float VIEW_HALF_ANGLE      = 0.61f; // 35 graus
+const float SKELETON_EYE_HEIGHT  = 1.5f;
+const float CATCH_DISTANCE       = 1.1f;  // encostar no esqueleto = captura
+
+// Alerta (0 a 1): sobe enquanto algum esqueleto vê o jogador (mais rápido de
+// perto), desce quando ninguém vê. Ao chegar em 1, o jogador é capturado.
+float g_Alert = 0.0f;
+float g_CaptureTimer = 0.0f; // > 0 durante a "cena" de captura
+glm::vec3 g_StartPos;
+float g_StartYaw = 0.0f;
+
+// Esconderijos: baús, caixotes e barris. Com Espaço perto de um deles, o
+// jogador se esconde (fica agachado, parado e invisível).
+struct HideSpot { AABB box; };
+std::vector<HideSpot> g_HideSpots;
+bool g_PlayerHidden = false;
+const float HIDE_DISTANCE = 1.6f;
+
+void UpdateVision(float delta_t);
+void CapturePlayer();
 
 void BuildSkeletons();
 void UpdateSkeletons(float delta_t, float time);
 void BuildDungeon();
 bool PlayerCollides(glm::vec3 feet_position);
 bool RayHitsColliders(glm::vec3 origin, glm::vec3 dir, float max_t, float& t_hit);
+void ToggleHide();
+bool NearHideSpot();
+
+// Malha dinâmica do cone de visão (um "leque" de triângulos no chão,
+// recalculado a cada quadro para cada esqueleto).
+const int CONE_RAYS = 24;
+GLuint g_ConeVAO = 0, g_ConeVBO = 0;
+GLint  g_cone_color_uniform;
+GLint  g_tint_uniform;
+void CreateVisionConeMesh();
+void DrawVisionCone(const Skeleton& sk, GLint model_uniform, GLint object_id_uniform);
 void UpdatePlayer(GLFWwindow* window, float delta_t);
 
 // Pilha que guardará as matrizes de modelagem.
@@ -514,6 +556,7 @@ int main(int argc, char* argv[])
 
         BuildDungeon();
         BuildSkeletons();
+        CreateVisionConeMesh();
 
         g_CameraDistance = 5.5f;
         g_CameraPhi = 0.50f;
@@ -573,6 +616,7 @@ int main(int argc, char* argv[])
         {
             UpdatePlayer(window, delta_t);
             UpdateSkeletons(delta_t, current_time);
+            UpdateVision(delta_t);
         }
 
         // Aqui executamos as operações de renderização
@@ -675,7 +719,13 @@ int main(int argc, char* argv[])
                     const glm::vec3 dir = to_cam / cam_dist;
                     float t_hit;
                     if (RayHitsColliders(head, dir, cam_dist, t_hit))
-                        cam = head + dir * std::max(0.3f, t_hit - 0.25f);
+                    {
+                        // Sem espaço atrás: aproximamos a câmera e, para não
+                        // ficar "dentro" da cabeça do jogador, subimos a
+                        // câmera proporcionalmente ao quanto ela foi encurtada.
+                        const float d = std::max(0.3f, t_hit - 0.25f);
+                        cam = head + dir * d + up * (0.8f * (cam_dist - d));
+                    }
                 }
 
                 // A câmera olha um pouco à frente do jogador, assim ele fica na
@@ -788,6 +838,9 @@ int main(int argc, char* argv[])
         glUniform1f(g_fog_density_uniform, (dungeon_preview && !g_TopDownCamera) ? FOG_DENSITY : 0.0f);
         glUniform3f(g_fog_color_uniform, FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z);
 
+        // Na captura, a cena fica avermelhada (mistura com vermelho).
+        glUniform4f(g_tint_uniform, 0.8f, 0.05f, 0.05f, (dungeon_preview && g_CaptureTimer > 0.0f) ? 0.55f : 0.0f);
+
         #define SPHERE 0
         #define BUNNY  1
         #define PLANE  2
@@ -842,6 +895,17 @@ int main(int argc, char* argv[])
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
             glUniform1i(g_object_id_uniform, STAFF);
             DrawVirtualObject("staff");
+
+            // Cones de visão: transparentes, então são desenhados por último,
+            // com blending e sem escrever no Z-buffer.
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDepthMask(GL_FALSE);
+            for (const Skeleton& sk : g_Skeletons)
+                if (glm::length(sk.pos - g_PlayerPos) < 40.0f)
+                    DrawVisionCone(sk, g_model_uniform, g_object_id_uniform);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
         }
         else
         {
@@ -877,11 +941,53 @@ int main(int argc, char* argv[])
                     "WASD: mover | setas ou botao esq. + mouse: virar | roda: zoom",
                     -1.0f + pad/10, 1.0f - pad, 1.0f);
                 TextRendering_PrintString(window,
-                    "C: agachar | Q: olhar para tras | botao dir.: girar camera | M: mapa (roda: zoom, arrastar: mover) | H: ocultar",
+                    "C: agachar | Espaco: esconder | Q: olhar para tras | M: mapa (roda: zoom, arrastar) | H: ocultar",
                     -1.0f + pad/10, 1.0f - 2*pad, 1.0f);
                 TextRendering_PrintString(window,
                     g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
                     -1.0f + pad/10, 1.0f - 3*pad, 1.0f);
+            }
+
+            // "?" ou "!" sobre os esqueletos que estão vendo o jogador: a
+            // posição acima da cabeça é projetada na tela (P * V * ponto, e
+            // divisão por w para obter coordenadas normalizadas).
+            for (const Skeleton& sk : g_Skeletons)
+            {
+                if (!sk.sees_player) continue;
+                glm::vec4 clip = projection * view * glm::vec4(sk.pos.x, 2.3f, sk.pos.z, 1.0f);
+                if (clip.w <= 0.0f) continue;
+                const float cw = TextRendering_CharWidth(window);
+                if (g_Alert < 0.6f) TextRendering_SetColor(1.0f, 0.9f, 0.2f);
+                else                TextRendering_SetColor(1.0f, 0.2f, 0.1f);
+                TextRendering_PrintString(window, g_Alert < 0.6f ? "?" : "!",
+                                          clip.x/clip.w - cw*1.5f, clip.y/clip.w, 3.0f);
+            }
+
+            // Barra de alerta e mensagens.
+            {
+                const float lh = TextRendering_LineHeight(window);
+                char bar[64];
+                const int filled = (int)(g_Alert * 20.0f + 0.5f);
+                std::string b = "Alerta: [";
+                for (int i = 0; i < 20; ++i) b += (i < filled) ? '#' : '.';
+                b += "]";
+                snprintf(bar, sizeof(bar), "%s", b.c_str());
+                if (g_Alert > 0.6f) TextRendering_SetColor(1.0f, 0.3f, 0.2f);
+                else if (g_Alert > 0.0f) TextRendering_SetColor(1.0f, 0.9f, 0.3f);
+                else TextRendering_SetColor(0.7f, 0.7f, 0.7f);
+                TextRendering_PrintString(window, bar, -1.0f + lh/10, -1.0f + lh/2, 1.2f);
+
+                std::string msg;
+                if (g_CaptureTimer > 0.0f)       msg = "CAPTURADO! Voltando ao inicio...";
+                else if (g_PlayerHidden)         msg = "ESCONDIDO  (ande para sair)";
+                else if (NearHideSpot())         msg = "Espaco: esconder";
+                if (!msg.empty())
+                {
+                    TextRendering_SetColor(1.0f, 1.0f, 1.0f);
+                    const float w = msg.size() * TextRendering_CharWidth(window) * 1.6f;
+                    TextRendering_PrintString(window, msg, -w/2, -0.75f, 1.6f);
+                }
+                TextRendering_SetColor(1.0f, 1.0f, 1.0f);
             }
         }
         else
@@ -1053,6 +1159,8 @@ void LoadShadersFromFiles()
     g_ambient_strength_uniform = glGetUniformLocation(g_GpuProgramID, "ambient_strength");
     g_fog_density_uniform = glGetUniformLocation(g_GpuProgramID, "fog_density");
     g_fog_color_uniform   = glGetUniformLocation(g_GpuProgramID, "fog_color");
+    g_cone_color_uniform  = glGetUniformLocation(g_GpuProgramID, "cone_color");
+    g_tint_uniform        = glGetUniformLocation(g_GpuProgramID, "tint");
 
     // Variáveis em "shader_fragment.glsl" para acesso das imagens de textura
     glUseProgram(g_GpuProgramID);
@@ -1755,7 +1863,11 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mod)
     }
 
     // Se o usuário apertar a tecla espaço, resetamos os ângulos de Euler para zero.
-    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
+    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS && g_DungeonMode)
+    {
+        ToggleHide();
+    }
+    else if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
     {
         g_AngleX = 0.0f;
         g_AngleY = 0.0f;
@@ -2131,6 +2243,11 @@ void BuildDungeon()
         {
             const SceneObject& obj = g_VirtualScene[mesh];
             g_Colliders.push_back(AABB_Transform(obj.bbox_min, obj.bbox_max, model));
+
+            // Baús, caixotes e barris também servem de esconderijo.
+            const std::string m = mesh;
+            if (m.find("box_") == 0 || m.find("crates") == 0 || m.find("barrel") == 0 || m.find("chest") == 0)
+                g_HideSpots.push_back({ g_Colliders.back() });
         }
     };
 
@@ -2226,6 +2343,8 @@ void BuildDungeon()
             // Começa virado para o primeiro vizinho livre.
             for (const Neighbor& nb : neighbors)
                 if (MapAt(r + nb.dr, c + nb.dc) != '#') { g_PlayerYaw = nb.yaw_into_cell + PI; break; }
+            g_StartPos = g_PlayerPos;
+            g_StartYaw = g_PlayerYaw;
             break;
         case 'c':
         {
@@ -2323,8 +2442,8 @@ void BuildSkeletons()
         { true,  { {5, 7}, {5, 15}, {13, 15}, {13, 7} } },
         { true,  { {13, 15}, {13, 7}, {5, 7}, {5, 15} } },
         // Corredores longos (vão e voltam).
-        { false, { {15, 1}, {15, 13} } },
-        { false, { {3, 8}, {3, 19} } },
+        { false, { {15, 7}, {15, 13} } },
+        { false, { {3, 8}, {3, 15} } },
         { false, { {2, 21}, {16, 21} } },
     };
 
@@ -2362,32 +2481,36 @@ void BuildSkeletons()
         sk.speed     = PATROL_SPEED;
         sk.pos       = points[0];
         sk.yaw       = 0.0f;
-        sk.base_yaw = sk.sweep_amplitude = sk.sweep_speed = 0.0f;
+        sk.yaw_a = sk.yaw_b = 0.0f;
         sk.phase     = 1.3f * index++;
+        sk.sees_player = false;
         g_Skeletons.push_back(sk);
     }
 
-    // Sentinelas: bloqueiam um corredor, girando de um lado para o outro.
-    struct SentinelDef { int row, col; float base_yaw, amplitude, speed; };
+    // Guardas: um em cada salinha de chave. Ficam num canto, alternando o
+    // olhar entre duas direções. A chave fica no canto oposto, escondida
+    // atrás de uma pilha de caixotes: é preciso esperar o guarda olhar para
+    // o outro lado e se esconder pelo caminho.
+    // yaw: 0 = sul (+Z), PI = norte (-Z), PI/2 = leste (+X), -PI/2 = oeste.
+    struct GuardDef { int row, col; float yaw_a, yaw_b; };
+    const float PI   = 3.141592f;
     const float PI_2 = 1.570796f;
-    const SentinelDef sentinels[] = {
-        // Um sentinela no meio de cada salinha perto das chaves, girando
-        // devagar e olhando para todos os lados.
-        { 4, 18,  0.0f, 2.0f * PI_2, 0.45f },
-        { 14, 4,  0.0f, 2.0f * PI_2, 0.40f },
-        { 14, 18, 0.0f, 2.0f * PI_2, 0.50f },
+    const GuardDef guards[] = {
+        { 5, 17,  PI,   PI_2 },  // salinha de cima à direita: norte / leste
+        { 15, 5,  PI,  -PI_2 },  // salinha de baixo à esquerda: norte / oeste
+        { 13, 17, PI_2, 0.0f },  // salinha de baixo à direita: leste / sul
     };
-    for (const SentinelDef& def : sentinels)
+    for (const GuardDef& def : guards)
     {
         Skeleton sk;
-        sk.type            = SENTINEL;
-        sk.pos             = CellCenter(def.row, def.col);
-        sk.base_yaw        = def.base_yaw;
-        sk.sweep_amplitude = def.amplitude;
-        sk.sweep_speed     = def.speed;
-        sk.phase           = 1.3f * index++;
-        sk.yaw             = def.base_yaw;
+        sk.type  = SENTINEL;
+        sk.pos   = CellCenter(def.row, def.col);
+        sk.yaw_a = def.yaw_a;
+        sk.yaw_b = def.yaw_b;
+        sk.yaw   = def.yaw_a;
+        sk.phase = 1.7f * index++;
         sk.closed = false; sk.u = 0.0f; sk.direction = 1.0f; sk.speed = 0.0f;
+        sk.sees_player = false;
         g_Skeletons.push_back(sk);
     }
 }
@@ -2409,9 +2532,38 @@ void UpdateSkeletons(float delta_t, float time)
 {
     for (Skeleton& sk : g_Skeletons)
     {
+        // Se está vendo o jogador, o esqueleto para e se vira para ele.
+        if (sk.sees_player)
+        {
+            const glm::vec3 to_player = g_PlayerPos - sk.pos;
+            sk.yaw = TurnTowards(sk.yaw, atan2f(to_player.x, to_player.z), 3.0f * delta_t);
+            continue;
+        }
+
         if (sk.type == SENTINEL)
         {
-            sk.yaw = sk.base_yaw + sk.sweep_amplitude * sinf(sk.sweep_speed * time + sk.phase);
+            // Ciclo: olha para A (parado) -> vira -> olha para B -> vira.
+            // Na virada, interpolamos o ângulo com uma curva suave
+            // (smoothstep), que começa e termina devagar.
+            const float cycle = 2.0f * (GUARD_HOLD_TIME + GUARD_TURN_TIME);
+            float k = fmodf(time + sk.phase, cycle);
+            float target;
+            if (k < GUARD_HOLD_TIME) target = sk.yaw_a;
+            else if (k < GUARD_HOLD_TIME + GUARD_TURN_TIME)
+            {
+                float x = (k - GUARD_HOLD_TIME) / GUARD_TURN_TIME;
+                x = x*x*(3.0f - 2.0f*x);
+                target = sk.yaw_a + (sk.yaw_b - sk.yaw_a) * x;
+            }
+            else if (k < 2.0f*GUARD_HOLD_TIME + GUARD_TURN_TIME) target = sk.yaw_b;
+            else
+            {
+                float x = (k - 2.0f*GUARD_HOLD_TIME - GUARD_TURN_TIME) / GUARD_TURN_TIME;
+                x = x*x*(3.0f - 2.0f*x);
+                target = sk.yaw_b + (sk.yaw_a - sk.yaw_b) * x;
+            }
+            // Volta suavemente para o ciclo depois de ter olhado o jogador.
+            sk.yaw = TurnTowards(sk.yaw, target, 3.0f * delta_t);
             continue;
         }
 
@@ -2449,6 +2601,153 @@ void UpdateSkeletons(float delta_t, float time)
         if (glm::length(dir) > 1e-4f)
             sk.yaw = TurnTowards(sk.yaw, atan2f(dir.x, dir.z), 4.0f * delta_t);
     }
+}
+
+// Visão dos esqueletos. Para cada esqueleto, o jogador é visto se:
+//  1) está a menos de VIEW_DISTANCE (menos ainda se agachado);
+//  2) está dentro do cone: o ângulo entre a direção do olhar e a direção
+//     até o jogador é menor que VIEW_HALF_ANGLE (comparamos cossenos, via
+//     produto escalar de vetores normalizados);
+//  3) nada bloqueia a linha de visão: lançamos um raio do olho do esqueleto
+//     até a cabeça do jogador e testamos contra todas as caixas de colisão
+//     (paredes, caixotes, baús...). Agachado, a cabeça fica mais baixa e o
+//     raio bate nos caixotes.
+// O alerta sobe enquanto algum esqueleto vê o jogador.
+void UpdateVision(float delta_t)
+{
+    bool seen = false;
+    float closest = 1e9f;
+    const float head_height = g_PlayerCrouching || g_PlayerHidden ? 0.8f : 1.4f;
+    const glm::vec3 head = g_PlayerPos + glm::vec3(0.0f, head_height, 0.0f);
+    const float range = g_PlayerCrouching ? VIEW_DISTANCE_CROUCH : VIEW_DISTANCE;
+
+    for (Skeleton& sk : g_Skeletons)
+    {
+        sk.sees_player = false;
+        if (g_PlayerHidden || g_CaptureTimer > 0.0f)
+            continue;
+
+        const glm::vec3 eye = sk.pos + glm::vec3(0.0f, SKELETON_EYE_HEIGHT, 0.0f);
+        glm::vec3 to_player = head - eye;
+        const float dist = glm::length(to_player);
+
+        // Encostar no esqueleto: captura imediata.
+        const glm::vec3 flat = g_PlayerPos - sk.pos;
+        if (glm::length(glm::vec3(flat.x, 0.0f, flat.z)) < CATCH_DISTANCE)
+        {
+            g_Alert = 1.0f;
+            sk.sees_player = true;
+            continue;
+        }
+
+        if (dist > range) continue;
+
+        const glm::vec3 look(sinf(sk.yaw), 0.0f, cosf(sk.yaw));
+        const glm::vec3 dir_flat = glm::normalize(glm::vec3(to_player.x, 0.0f, to_player.z));
+        if (glm::dot(look, dir_flat) < cosf(VIEW_HALF_ANGLE)) continue;
+
+        float t_hit;
+        if (RayHitsColliders(eye, to_player / dist, dist, t_hit)) continue;
+
+        sk.sees_player = true;
+        seen = true;
+        closest = std::min(closest, dist);
+    }
+
+    if (seen)
+        g_Alert += delta_t * (0.35f + 3.0f / (closest + 1.0f));
+    else
+        g_Alert -= delta_t * 0.5f;
+    g_Alert = std::max(0.0f, std::min(1.0f, g_Alert));
+
+    if (g_Alert >= 1.0f && g_CaptureTimer <= 0.0f)
+        CapturePlayer();
+}
+
+// Captura: começa a "cena" de captura (tela avermelhada por alguns
+// segundos); ao final, o jogador volta ao início (veja UpdatePlayer).
+void CapturePlayer()
+{
+    g_CaptureTimer = 2.0f;
+    g_PlayerHidden = false;
+}
+
+// Verdadeiro se o jogador está perto de algum esconderijo (distância, no
+// plano XZ, do jogador até a caixa do objeto).
+bool NearHideSpot()
+{
+    for (const HideSpot& h : g_HideSpots)
+    {
+        const float dx = std::max(std::max(h.box.min.x - g_PlayerPos.x, 0.0f), g_PlayerPos.x - h.box.max.x);
+        const float dz = std::max(std::max(h.box.min.z - g_PlayerPos.z, 0.0f), g_PlayerPos.z - h.box.max.z);
+        if (sqrtf(dx*dx + dz*dz) < HIDE_DISTANCE)
+            return true;
+    }
+    return false;
+}
+
+// Tenta esconder (ou tirar do esconderijo) o jogador.
+void ToggleHide()
+{
+    if (g_PlayerHidden) { g_PlayerHidden = false; return; }
+    if (g_CaptureTimer <= 0.0f && NearHideSpot())
+        g_PlayerHidden = true;
+}
+
+// Cria o VAO/VBO do cone de visão. Os vértices são atualizados a cada
+// desenho (GL_DYNAMIC_DRAW): o ápice no esqueleto e CONE_RAYS+1 pontos no
+// arco, formando um "leque" (GL_TRIANGLE_FAN). Só usamos a posição
+// (location 0); normais e coordenadas de textura não são necessárias.
+void CreateVisionConeMesh()
+{
+    glGenVertexArrays(1, &g_ConeVAO);
+    glBindVertexArray(g_ConeVAO);
+    glGenBuffers(1, &g_ConeVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, g_ConeVBO);
+    glBufferData(GL_ARRAY_BUFFER, (CONE_RAYS + 2) * 4 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
+// Desenha o cone de visão de um esqueleto no chão. Cada um dos raios do
+// leque é "cortado" onde bate numa parede ou objeto (raio x AABB), então o
+// cone mostra exatamente a área que o esqueleto enxerga, com as "sombras"
+// atrás dos caixotes, onde dá para se esconder.
+void DrawVisionCone(const Skeleton& sk, GLint model_uniform, GLint object_id_uniform)
+{
+    #define VISION_CONE 7
+    const float y_draw = 0.08f;  // um pouco acima do piso
+    const float y_test = 1.0f;   // altura dos raios para o corte
+    std::vector<float> v;
+    v.reserve((CONE_RAYS + 2) * 4);
+    v.insert(v.end(), { sk.pos.x, y_draw, sk.pos.z, 1.0f });
+    for (int i = 0; i <= CONE_RAYS; ++i)
+    {
+        const float a = sk.yaw - VIEW_HALF_ANGLE + 2.0f * VIEW_HALF_ANGLE * i / CONE_RAYS;
+        const glm::vec3 dir(sinf(a), 0.0f, cosf(a));
+        float t = VIEW_DISTANCE;
+        float t_hit;
+        if (RayHitsColliders(glm::vec3(sk.pos.x, y_test, sk.pos.z), dir, VIEW_DISTANCE, t_hit))
+            t = t_hit;
+        v.insert(v.end(), { sk.pos.x + dir.x * t, y_draw, sk.pos.z + dir.z * t, 1.0f });
+    }
+
+    glBindBuffer(GL_ARRAY_BUFFER, g_ConeVBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, v.size() * sizeof(float), v.data());
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // Amarelo quando está só olhando; vermelho quando vê o jogador.
+    if (sk.sees_player) glUniform4f(g_cone_color_uniform, 1.0f, 0.15f, 0.05f, 0.40f);
+    else                glUniform4f(g_cone_color_uniform, 1.0f, 0.85f, 0.25f, 0.22f);
+
+    const glm::mat4 identity = Matrix_Identity();
+    glUniformMatrix4fv(model_uniform, 1, GL_FALSE, glm::value_ptr(identity));
+    glUniform1i(object_id_uniform, VISION_CONE);
+    glBindVertexArray(g_ConeVAO);
+    glDrawArrays(GL_TRIANGLE_FAN, 0, CONE_RAYS + 2);
+    glBindVertexArray(0);
 }
 
 // Teste de colisão do jogador: monta a AABB do jogador (centrada em 'p', com os
@@ -2490,6 +2789,32 @@ bool RayHitsColliders(glm::vec3 origin, glm::vec3 dir, float max_t, float& t_hit
 // proporcional a delta_t.
 void UpdatePlayer(GLFWwindow* window, float delta_t)
 {
+    // Durante a captura o jogador não se move; ao terminar, volta ao início.
+    if (g_CaptureTimer > 0.0f)
+    {
+        g_CaptureTimer -= delta_t;
+        if (g_CaptureTimer <= 0.0f)
+        {
+            g_PlayerPos = g_StartPos;
+            g_PlayerYaw = g_StartYaw;
+            g_Alert = 0.0f;
+            g_FollowCameraInitialized = false;
+        }
+        return;
+    }
+
+    // Escondido: parado e agachado. Andar sai do esconderijo.
+    if (g_PlayerHidden)
+    {
+        g_PlayerCrouching = true;
+        g_LookBack = (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
+        if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS ||
+            glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+            g_PlayerHidden = false;
+        else
+            return;
+    }
+
     if (glfwGetKey(window, GLFW_KEY_LEFT)  == GLFW_PRESS) g_PlayerYaw += PLAYER_TURN_SPEED * delta_t;
     if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) g_PlayerYaw -= PLAYER_TURN_SPEED * delta_t;
 
