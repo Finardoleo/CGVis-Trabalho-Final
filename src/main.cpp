@@ -189,6 +189,7 @@ struct Instance
 {
     std::string mesh;
     glm::mat4   model;
+    bool        visible = true; // itens coletados deixam de ser desenhados
 };
 
 std::vector<Instance>  g_Instances;   // Tudo que é desenhado na masmorra
@@ -245,10 +246,10 @@ const float PLAYER_MODEL_SCALE  = 0.72f; // o modelo do ladrão tem 2.24 de altu
 // texto, uma linha por fileira de células (eixo Z) e uma coluna por célula
 // (eixo X):
 //   '#' parede        '.' chão          'S' início do jogador
-//   'E' saída         'c' caixote (dá para se esconder agachado)
+//   'c' caixote (dá para se esconder)
 //   'b' barril        'B' baú           'K' chave      '$' tesouro
-//   'G' portão da sala do tesouro (abre com as chaves)
-//   'Z' cajado mágico (o prêmio da sala do tesouro)
+//   'G' portão da sala do tesouro (abre com a chave)
+//   'Z' cajado mágico (o prêmio: pegá-lo termina o jogo)
 //   'P' pilar decorado
 // A sala do tesouro fica no centro (linhas 7..11, colunas 9..13) e tem uma
 // decoração diferente: piso de madeira escura, estandartes verdes, ouro e a
@@ -262,15 +263,15 @@ const char* DUNGEON_MAP[] = {
     "#.#...#########.#.c.#.#",
     "#.....#..c...c..#...#.#",
     "###.###.#######.#.#.#.#",
-    "#b...B#.#$.E.$#.#...#.#",
+    "#b...B#.#$...$#.#...#.#",
     "#.#.###.#.P.P.#.#.###.#",
     "#.#b..#c#..Z..#c#...#.#",
     "#.###.#.#.P.P.#.#.#.#.#",
     "#.....#.#$...$#.#...#.#",
     "#.#####.###G###.#.###.#",
-    "#.#K.....c...c..#.....#",
+    "#.#$.....c...c..#.....#",
     "#.#.c.###########.c.#.#",
-    "#.............#....K..#",
+    "#.............#....$..#",
     "#.###########.#.###.#.#",
     "#$.........$#........$#",
     "#######################",
@@ -353,6 +354,56 @@ const float HIDE_DISTANCE = 1.6f;
 
 void UpdateVision(float delta_t);
 void CapturePlayer();
+
+// ---------------------------------------------------------------------------
+// Objetivo: pegar a chave, abrir o portão e pegar o cajado.
+// ---------------------------------------------------------------------------
+// Itens coletáveis (a chave e os tesouros): basta passar por cima.
+struct Pickup
+{
+    int       instance;  // índice em g_Instances (para esconder/animar)
+    glm::mat4 base_model;
+    glm::vec3 pos;
+    bool      is_key;
+    bool      taken;
+};
+std::vector<Pickup> g_Pickups;
+bool g_HasKey = false;
+int  g_TreasureCount = 0, g_TreasureTotal = 0;
+const float PICKUP_DISTANCE = 1.3f;
+
+// Portão da sala do tesouro: sobe (animação por delta_t) quando o jogador
+// chega perto com a chave; a caixa de colisão é removida.
+int       g_GateInstance = -1, g_GateCollider = -1;
+glm::mat4 g_GateBaseModel;
+glm::vec3 g_GatePos;
+AABB      g_GateBox;
+float     g_GateOpening = 0.0f; // 0 = fechado, 1 = aberto
+
+// Final: ao pegar o cajado (E), o ladrão dá um pulinho, o cajado solta um
+// clarão (a tela vai ficando branca) e o jogo termina.
+enum GameState { PLAYING, ENDING, WON };
+GameState g_GameState = PLAYING;
+float g_EndTimer  = 0.0f;
+float g_GameTime  = 0.0f; // tempo de jogo, mostrado no final
+bool  g_StaffTaken = false;
+const float STAFF_REACH = 2.3f;
+const float JUMP_TIME   = 0.6f;
+const float FLASH_TIME  = 2.2f; // fim do clarão (tela totalmente branca)
+
+void UpdateObjectives(GLFWwindow* window, float delta_t);
+void ResetGame();
+
+// Teclas de ação lidas como evento (no KeyCallback), para nenhum toque
+// rápido se perder entre dois quadros.
+bool g_InteractPressed = false; // E
+bool g_ConfirmPressed  = false; // ENTER
+
+// Distância no plano XZ (ignora a altura).
+float FlatDistance(glm::vec3 a, glm::vec3 b)
+{
+    return glm::length(glm::vec2(a.x - b.x, a.z - b.z));
+}
 
 void BuildSkeletons();
 void UpdateSkeletons(float delta_t, float time);
@@ -523,7 +574,7 @@ int main(int argc, char* argv[])
         const char* dungeon_models[] = {
             "floor_tile_large", "wall", "chest", "torch_mounted", "box_large",
             "crates_stacked", "barrel_small", "coin_stack_large", "key",
-            "wall_doorway", "wall_doorway_door", "wall_gated",
+            "wall_gated",
             "floor_wood_large_dark", "pillar_decorated", "banner_patternA_green",
             "banner_thin_green", "chest_gold", "candle_triple", "column",
         };
@@ -614,9 +665,13 @@ int main(int argc, char* argv[])
 
         if (dungeon_preview)
         {
-            UpdatePlayer(window, delta_t);
-            UpdateSkeletons(delta_t, current_time);
-            UpdateVision(delta_t);
+            if (g_GameState == PLAYING)
+            {
+                UpdatePlayer(window, delta_t);
+                UpdateSkeletons(delta_t, current_time);
+                UpdateVision(delta_t);
+            }
+            UpdateObjectives(window, delta_t);
         }
 
         // Aqui executamos as operações de renderização
@@ -628,7 +683,13 @@ int main(int argc, char* argv[])
         //
         //           R     G     B     A
         if (dungeon_preview)
-            glClearColor(FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z, 1.0f); // fundo escuro de masmorra
+        {
+            // Fundo escuro de masmorra; no clarão do final, vai ficando branco.
+            const float w = (g_GameState == PLAYING) ? 0.0f
+                : std::max(0.0f, std::min(1.0f, (g_EndTimer - 0.4f) / (FLASH_TIME - 0.4f)));
+            const glm::vec3 bg = FOG_COLOR + (glm::vec3(1.0f, 1.0f, 0.95f) - FOG_COLOR) * w;
+            glClearColor(bg.x, bg.y, bg.z, 1.0f);
+        }
         else
             glClearColor(0.9f, 0.9f, 1.0f, 1.0f);
 
@@ -794,7 +855,10 @@ int main(int argc, char* argv[])
             std::vector<int> order;
             for (size_t i = 0; i < g_TorchLights.size(); ++i) order.push_back((int)i);
             order.push_back(-1);
-            auto light_pos = [](int i) { return i < 0 ? g_StaffPos + glm::vec3(0.0f, 1.0f, 0.0f) : g_TorchLights[i]; };
+            auto light_pos = [](int i) {
+                if (i >= 0) return g_TorchLights[i];
+                return g_StaffTaken ? g_PlayerPos + glm::vec3(0.0f, 3.0f, 0.0f) : g_StaffPos + glm::vec3(0.0f, 1.0f, 0.0f);
+            };
             std::sort(order.begin(), order.end(), [&](int a, int b) {
                 return glm::length(light_pos(a) - g_PlayerPos) < glm::length(light_pos(b) - g_PlayerPos);
             });
@@ -809,6 +873,9 @@ int main(int argc, char* argv[])
                     // Luz mágica do cajado: verde e intensa, pulsando devagar.
                     const float pulse = 0.8f + 0.2f * sinf(current_time * 2.0f);
                     color = glm::vec3(0.8f, 4.5f, 1.6f) * pulse;
+                    // No final, o cajado solta um clarão cada vez mais forte.
+                    if (g_GameState != PLAYING)
+                        color = glm::vec3(1.0f, 3.0f, 1.5f) * (1.0f + 12.0f * g_EndTimer);
                 }
                 else
                 {
@@ -839,7 +906,14 @@ int main(int argc, char* argv[])
         glUniform3f(g_fog_color_uniform, FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z);
 
         // Na captura, a cena fica avermelhada (mistura com vermelho).
-        glUniform4f(g_tint_uniform, 0.8f, 0.05f, 0.05f, (dungeon_preview && g_CaptureTimer > 0.0f) ? 0.55f : 0.0f);
+        if (dungeon_preview && g_GameState != PLAYING)
+        {
+            // Clarão do final: a cena vai ficando branca.
+            const float w = std::max(0.0f, std::min(1.0f, (g_EndTimer - 0.4f) / (FLASH_TIME - 0.4f)));
+            glUniform4f(g_tint_uniform, 1.0f, 1.0f, 0.95f, w);
+        }
+        else
+            glUniform4f(g_tint_uniform, 0.8f, 0.05f, 0.05f, (dungeon_preview && g_CaptureTimer > 0.0f) ? 0.55f : 0.0f);
 
         #define SPHERE 0
         #define BUNNY  1
@@ -856,6 +930,7 @@ int main(int argc, char* argv[])
             glUniform1i(g_object_id_uniform, DUNGEON_OBJECT);
             for (const Instance& inst : g_Instances)
             {
+                if (!inst.visible) continue;
                 glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(inst.model));
                 DrawVirtualObject(inst.mesh.c_str());
             }
@@ -866,7 +941,11 @@ int main(int argc, char* argv[])
             // Os pés do modelo do ladrão estão em y = 0 (coordenadas do modelo).
             const float s = PLAYER_MODEL_SCALE;
             const float crouch = g_PlayerCrouching ? 0.65f : 1.0f;
-            model = Matrix_Translate(g_PlayerPos.x, g_PlayerPos.y + 0.05f, g_PlayerPos.z)
+            // Pulinho no final: altura = 0.9 * sin(pi * t / duração).
+            float jump = 0.0f;
+            if (g_GameState != PLAYING && g_EndTimer < JUMP_TIME)
+                jump = 0.9f * sinf(3.141592f * g_EndTimer / JUMP_TIME);
+            model = Matrix_Translate(g_PlayerPos.x, g_PlayerPos.y + 0.05f + jump, g_PlayerPos.z)
                   * Matrix_Rotate_Y(g_PlayerYaw + PLAYER_MODEL_YAW_OFFSET)
                   * Matrix_Scale(s, s*crouch, s);
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
@@ -887,11 +966,17 @@ int main(int argc, char* argv[])
                 DrawVirtualObject(sk.type == PATROL ? "skeleton" : "skeleton_warrior");
             }
 
-            // Cajado mágico: flutua (sobe e desce) e gira em torno de Y.
-            model = Matrix_Translate(g_StaffPos.x, g_StaffPos.y + 0.15f * sinf(current_time * 1.5f), g_StaffPos.z)
-                  * Matrix_Rotate_Y(current_time * 0.8f)
-                  * Matrix_Rotate_Z(0.25f)
-                  * Matrix_Scale(0.9f, 0.9f, 0.9f);
+            // Cajado mágico: flutua (sobe e desce) e gira em torno de Y. Depois
+            // de pego, fica erguido acima do ladrão.
+            if (!g_StaffTaken)
+                model = Matrix_Translate(g_StaffPos.x, g_StaffPos.y + 0.15f * sinf(current_time * 1.5f), g_StaffPos.z)
+                      * Matrix_Rotate_Y(current_time * 0.8f)
+                      * Matrix_Rotate_Z(0.25f)
+                      * Matrix_Scale(0.9f, 0.9f, 0.9f);
+            else
+                model = Matrix_Translate(g_PlayerPos.x, 1.6f + 0.6f * std::min(1.0f, g_EndTimer / JUMP_TIME), g_PlayerPos.z)
+                      * Matrix_Rotate_Y(current_time * 3.0f)
+                      * Matrix_Scale(0.7f, 0.7f, 0.7f);
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
             glUniform1i(g_object_id_uniform, STAFF);
             DrawVirtualObject("staff");
@@ -938,13 +1023,13 @@ int main(int argc, char* argv[])
             {
                 float pad = TextRendering_LineHeight(window);
                 TextRendering_PrintString(window,
-                    "WASD: mover | setas ou botao esq. + mouse: virar | roda: zoom",
+                    "WASD: move | arrows or left mouse drag: turn | wheel: zoom",
                     -1.0f + pad/10, 1.0f - pad, 1.0f);
                 TextRendering_PrintString(window,
-                    "C: agachar | Espaco: esconder | Q: olhar para tras | M: mapa (roda: zoom, arrastar) | H: ocultar",
+                    "C: crouch | Space: hide | Q: look back | M: map (wheel: zoom, drag: pan) | H: hide help",
                     -1.0f + pad/10, 1.0f - 2*pad, 1.0f);
                 TextRendering_PrintString(window,
-                    g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
+                    g_TopDownCamera ? "Camera: map (top-down)" : "Camera: third person",
                     -1.0f + pad/10, 1.0f - 3*pad, 1.0f);
             }
 
@@ -968,7 +1053,7 @@ int main(int argc, char* argv[])
                 const float lh = TextRendering_LineHeight(window);
                 char bar[64];
                 const int filled = (int)(g_Alert * 20.0f + 0.5f);
-                std::string b = "Alerta: [";
+                std::string b = "Alert: [";
                 for (int i = 0; i < 20; ++i) b += (i < filled) ? '#' : '.';
                 b += "]";
                 snprintf(bar, sizeof(bar), "%s", b.c_str());
@@ -977,16 +1062,49 @@ int main(int argc, char* argv[])
                 else TextRendering_SetColor(0.7f, 0.7f, 0.7f);
                 TextRendering_PrintString(window, bar, -1.0f + lh/10, -1.0f + lh/2, 1.2f);
 
+                // Inventário e tempo (canto inferior direito).
+                char inv[96];
+                snprintf(inv, sizeof(inv), "Key: %d/1   Treasure: %d/%d   Time: %02d:%02d",
+                         g_HasKey ? 1 : 0, g_TreasureCount, g_TreasureTotal,
+                         (int)g_GameTime / 60, (int)g_GameTime % 60);
+                TextRendering_SetColor(1.0f, 0.85f, 0.4f);
+                const float inv_w = strlen(inv) * TextRendering_CharWidth(window) * 1.2f;
+                TextRendering_PrintString(window, inv, 1.0f - inv_w - lh/10, -1.0f + lh/2, 1.2f);
+
                 std::string msg;
-                if (g_CaptureTimer > 0.0f)       msg = "CAPTURADO! Voltando ao inicio...";
-                else if (g_PlayerHidden)         msg = "ESCONDIDO  (ande para sair)";
-                else if (NearHideSpot())         msg = "Espaco: esconder";
+                if (g_GameState != PLAYING)      msg = "";
+                else if (g_CaptureTimer > 0.0f)  msg = "CAUGHT! Back to the start...";
+                else if (g_PlayerHidden)         msg = "HIDDEN  (move to leave)";
+                else if (!g_StaffTaken && FlatDistance(g_StaffPos, g_PlayerPos) < STAFF_REACH)
+                                                 msg = "E: take the magic staff";
+                else if (!g_HasKey && FlatDistance(g_GatePos, g_PlayerPos) < 4.5f)
+                                                 msg = "The gate is locked. Find the key!";
+                else if (NearHideSpot())         msg = "Space: hide";
                 if (!msg.empty())
                 {
                     TextRendering_SetColor(1.0f, 1.0f, 1.0f);
                     const float w = msg.size() * TextRendering_CharWidth(window) * 1.6f;
                     TextRendering_PrintString(window, msg, -w/2, -0.75f, 1.6f);
                 }
+                TextRendering_SetColor(1.0f, 1.0f, 1.0f);
+            }
+
+            // Tela final (sobre o fundo branco do clarão).
+            if (g_GameState == WON)
+            {
+                const float cw = TextRendering_CharWidth(window);
+                auto centered = [&](const std::string& text, float y, float scale) {
+                    TextRendering_PrintString(window, text, -(float)text.size() * cw * scale / 2.0f, y, scale);
+                };
+                char line[96];
+                TextRendering_SetColor(0.1f, 0.35f, 0.15f);
+                centered("YOU ESCAPED!", 0.25f, 4.0f);
+                TextRendering_SetColor(0.15f, 0.15f, 0.15f);
+                centered("The magic staff took you back to the real world.", 0.05f, 1.5f);
+                snprintf(line, sizeof(line), "Treasure: %d/%d    Time: %02d:%02d",
+                         g_TreasureCount, g_TreasureTotal, (int)g_GameTime / 60, (int)g_GameTime % 60);
+                centered(line, -0.12f, 1.8f);
+                centered("Press ENTER to play again or ESC to quit", -0.35f, 1.3f);
                 TextRendering_SetColor(1.0f, 1.0f, 1.0f);
             }
         }
@@ -1863,6 +1981,11 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mod)
     }
 
     // Se o usuário apertar a tecla espaço, resetamos os ângulos de Euler para zero.
+    if (key == GLFW_KEY_E && action == GLFW_PRESS)
+        g_InteractPressed = true;
+    if ((key == GLFW_KEY_ENTER || key == GLFW_KEY_KP_ENTER) && action == GLFW_PRESS)
+        g_ConfirmPressed = true;
+
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS && g_DungeonMode)
     {
         ToggleHide();
@@ -2296,14 +2419,10 @@ void BuildDungeon()
         // dentro da célula da parede. O painel do KayKit está ao longo de X;
         // para as bordas leste/oeste, rotacionamos 90 graus.
         int wall_count = 0;
-        bool exit_edge_skipped = false;
         for (const Neighbor& nb : neighbors)
         {
             if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
             ++wall_count;
-
-            // Na saída, a primeira parede vira um portal (desenhado abaixo).
-            if (cell == 'E' && !exit_edge_skipped) { exit_edge_skipped = true; continue; }
 
             const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
             const glm::vec3 p = center + to_wall * (half + 0.5f);
@@ -2382,7 +2501,13 @@ void BuildDungeon()
                 add("coin_stack_large_Cube.022", at_center * Matrix_Translate(1.0f, 0.0f, 0.9f) * Matrix_Scale(0.6f, 0.6f, 0.6f), false);
             }
             else
-                add("coin_stack_large_Cube.022", at_center * Matrix_Scale(0.7f, 0.7f, 0.7f), false);
+            {
+                // Tesouro coletável.
+                const glm::mat4 m = at_center * Matrix_Scale(0.7f, 0.7f, 0.7f);
+                add("coin_stack_large_Cube.022", m, false);
+                g_Pickups.push_back({ (int)g_Instances.size() - 1, m, center, false, false });
+                ++g_TreasureTotal;
+            }
             break;
         case 'P':
             add("pillar_decorated_Cube.005", at_center, true);
@@ -2401,9 +2526,13 @@ void BuildDungeon()
             break;
         }
         case 'K':
-            // Chave flutuando (a lógica de coletar vem numa próxima parte).
-            add("key_Torus.035", at_center * Matrix_Translate(-0.25f, 1.0f, 0.0f) * Matrix_Rotate_Z(PI_2), false);
+        {
+            // A chave flutua e gira (animada em UpdateObjectives).
+            const glm::mat4 m = at_center * Matrix_Translate(0.0f, 1.0f, 0.0f);
+            add("key_Torus.035", m, false);
+            g_Pickups.push_back({ (int)g_Instances.size() - 1, m, center, true, false });
             break;
+        }
         case 'G':
         {
             // Portão da sala do tesouro: grade atravessando o corredor. Se o
@@ -2411,22 +2540,14 @@ void BuildDungeon()
             // fica ao longo de X; senão, girada 90 graus. Por enquanto fica
             // sempre fechado (é uma caixa de colisão).
             const bool corridor_along_z = MapAt(r - 1, c) != '#' && MapAt(r + 1, c) != '#';
-            add("wall_gated_Cube.13125", at_center * Matrix_Rotate_Y(corridor_along_z ? 0.0f : PI_2), true);
+            g_GateBaseModel = at_center * Matrix_Rotate_Y(corridor_along_z ? 0.0f : PI_2);
+            add("wall_gated_Cube.13125", g_GateBaseModel, true);
+            g_GateInstance = (int)g_Instances.size() - 1;
+            g_GateCollider = (int)g_Colliders.size() - 1;
+            g_GateBox      = g_Colliders.back();
+            g_GatePos      = center;
             break;
         }
-        case 'E':
-            // Saída: um portal com porta na parede vizinha.
-            for (const Neighbor& nb : neighbors)
-            {
-                if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
-                const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
-                const glm::vec3 p = center + to_wall * (half + 0.5f);
-                const glm::mat4 m = Matrix_Translate(p.x, 0.0f, p.z) * Matrix_Rotate_Y(nb.dc != 0 ? PI_2 : 0.0f);
-                add("wall_doorway_Cube.13132", m, false);
-                add("wall_doorway_door_Cube.13134", m, false);
-                break;
-            }
-            break;
         }
     }
 }
@@ -2748,6 +2869,101 @@ void DrawVisionCone(const Skeleton& sk, GLint model_uniform, GLint object_id_uni
     glBindVertexArray(g_ConeVAO);
     glDrawArrays(GL_TRIANGLE_FAN, 0, CONE_RAYS + 2);
     glBindVertexArray(0);
+}
+
+// Coleta de itens, portão e final do jogo.
+void UpdateObjectives(GLFWwindow* window, float delta_t)
+{
+    const float time = (float)glfwGetTime();
+
+    if (g_GameState == PLAYING)
+    {
+        g_GameTime += delta_t;
+
+        // Itens: a chave gira e flutua; passar por cima coleta.
+        for (Pickup& p : g_Pickups)
+        {
+            if (p.taken) continue;
+            if (p.is_key)
+                g_Instances[p.instance].model = p.base_model
+                    * Matrix_Translate(0.0f, 0.15f * sinf(time * 2.5f), 0.0f)
+                    * Matrix_Rotate_Y(time * 2.0f)
+                    * Matrix_Translate(-0.25f, 0.0f, 0.0f) // centro da argola
+                    * Matrix_Rotate_Z(1.570796f);
+            if (FlatDistance(p.pos, g_PlayerPos) < PICKUP_DISTANCE && g_CaptureTimer <= 0.0f)
+            {
+                p.taken = true;
+                g_Instances[p.instance].visible = false;
+                if (p.is_key) g_HasKey = true;
+                else          ++g_TreasureCount;
+            }
+        }
+
+        // Portão: com a chave, abre ao chegar perto.
+        if (g_HasKey && g_GateOpening == 0.0f && FlatDistance(g_GatePos, g_PlayerPos) < 4.5f)
+            g_GateOpening = 0.0001f;
+
+        // E perto do cajado: pegar.
+        if (!g_StaffTaken && FlatDistance(g_StaffPos, g_PlayerPos) < STAFF_REACH && g_InteractPressed)
+        {
+            g_StaffTaken = true;
+            g_GameState  = ENDING;
+            g_EndTimer   = 0.0f;
+            g_PlayerHidden = false;
+            g_Alert = 0.0f;
+            for (Skeleton& sk : g_Skeletons) sk.sees_player = false;
+        }
+    }
+    else
+    {
+        g_EndTimer += delta_t;
+        if (g_GameState == ENDING && g_EndTimer >= FLASH_TIME + 0.4f)
+            g_GameState = WON;
+        if (g_GameState == WON && g_ConfirmPressed)
+            ResetGame();
+    }
+    g_InteractPressed = false;
+    g_ConfirmPressed  = false;
+
+    // Animação do portão subindo (1.5 s). Quando já subiu o bastante, a
+    // caixa de colisão é levada para longe (o jogador passa).
+    if (g_GateOpening > 0.0f && g_GateOpening < 1.0f)
+    {
+        g_GateOpening = std::min(1.0f, g_GateOpening + delta_t / 1.5f);
+        const float s = g_GateOpening * g_GateOpening * (3.0f - 2.0f * g_GateOpening);
+        g_Instances[g_GateInstance].model = Matrix_Translate(0.0f, 3.7f * s, 0.0f) * g_GateBaseModel;
+        if (g_GateOpening > 0.6f)
+        {
+            g_Colliders[g_GateCollider].min = glm::vec3(0.0f, -200.0f, 0.0f);
+            g_Colliders[g_GateCollider].max = glm::vec3(0.0f, -199.0f, 0.0f);
+        }
+    }
+}
+
+// Recomeça o jogo do zero (ENTER na tela final).
+void ResetGame()
+{
+    g_GameState = PLAYING;
+    g_EndTimer = 0.0f;
+    g_GameTime = 0.0f;
+    g_StaffTaken = false;
+    g_HasKey = false;
+    g_TreasureCount = 0;
+    for (Pickup& p : g_Pickups)
+    {
+        p.taken = false;
+        g_Instances[p.instance].visible = true;
+        g_Instances[p.instance].model = p.base_model;
+    }
+    g_GateOpening = 0.0f;
+    g_Instances[g_GateInstance].model = g_GateBaseModel;
+    g_Colliders[g_GateCollider] = g_GateBox;
+    g_PlayerPos = g_StartPos;
+    g_PlayerYaw = g_StartYaw;
+    g_PlayerHidden = false;
+    g_Alert = 0.0f;
+    g_CaptureTimer = 0.0f;
+    g_FollowCameraInitialized = false;
 }
 
 // Teste de colisão do jogador: monta a AABB do jogador (centrada em 'p', com os
