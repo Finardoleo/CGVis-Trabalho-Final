@@ -20,4 +20,9 @@ AABB AABB_Transform(glm::vec3 bbox_min, glm::vec3 bbox_max, const glm::mat4& mod
 // Teste de intersecção AABB x AABB (sobreposição nos 3 eixos).
 bool AABB_Intersects(const AABB& a, const AABB& b);
 
+// Teste de intersecção raio x AABB (método das "slabs"). O raio é
+// p(t) = origin + t*dir, com t >= 0. Se o raio atinge a caixa, devolve true e
+// coloca em t_hit o menor t de entrada na caixa (0 se a origem está dentro).
+bool Ray_AABB(glm::vec3 origin, glm::vec3 dir, const AABB& box, float& t_hit);
+
 #endif // COLLISIONS_H

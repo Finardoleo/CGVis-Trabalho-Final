@@ -197,6 +197,24 @@ glm::vec3 g_PlayerPos = glm::vec3(0.0f, 0.0f, -3.0f); // Pés do jogador
 float g_PlayerYaw     = 0.0f;                         // Rotação em Y
 bool  g_PlayerCrouching = false;
 bool  g_TopDownCamera = false;                        // Tecla M alterna
+bool  g_DungeonMode   = false;                        // false = cena antiga (--lab)
+
+// Câmera em 3ª pessoa: fica atrás do jogador, a uma distância
+// g_CameraDistance e elevada pelo ângulo g_CameraPhi. A posição é suavizada
+// (g_FollowCameraPos persegue a posição ideal) para não ficar "grudada".
+glm::vec3 g_FollowCameraPos = glm::vec3(0.0f);
+bool      g_FollowCameraInitialized = false;
+const float CAMERA_MIN_DISTANCE = 1.5f;
+const float CAMERA_MAX_DISTANCE = 7.0f;
+const float CAMERA_MIN_PHI      = 0.05f;  // quase na altura do ombro
+const float CAMERA_MAX_PHI      = 1.30f;  // quase vertical
+const float CAMERA_SMOOTHING    = 10.0f;  // maior = acompanha mais rápido
+const float PLAYER_TURN_SPEED   = 2.2f;   // giro pelas setas (rad/s)
+const float MOUSE_TURN_SENSITIVITY = 0.006f;
+
+// Rotação extra aplicada só ao desenhar o modelo, para que a "frente" do
+// modelo .obj coincida com a direção para onde o jogador anda.
+const float PLAYER_MODEL_YAW_OFFSET = 3.141592f/2.0f; // o coelho olha para -X
 
 const float PLAYER_SPEED        = 3.5f; // unidades por segundo
 const float PLAYER_SPEED_CROUCH = 1.5f;
@@ -205,6 +223,7 @@ const float PLAYER_HEIGHT       = 1.0f;
 
 void BuildDungeon();
 bool PlayerCollides(glm::vec3 feet_position);
+bool RayHitsColliders(glm::vec3 origin, glm::vec3 dir, float max_t, float& t_hit);
 void UpdatePlayer(GLFWwindow* window, float delta_t);
 
 // Pilha que guardará as matrizes de modelagem.
@@ -268,6 +287,7 @@ int main(int argc, char* argv[])
     // coelho e plano), execute com o argumento --lab.
     const bool dungeon_preview =
         !(argc > 1 && std::string(argv[1]) == "--lab");
+    g_DungeonMode = dungeon_preview;
 
     // Inicializamos a biblioteca GLFW, utilizada para criar uma janela do
     // sistema operacional, onde poderemos renderizar com OpenGL.
@@ -371,8 +391,8 @@ int main(int argc, char* argv[])
 
         BuildDungeon();
 
-        g_CameraDistance = 5.0f;
-        g_CameraPhi = 0.6f;
+        g_CameraDistance = 3.2f;
+        g_CameraPhi = 0.35f;
     }
     else
     {
@@ -483,10 +503,50 @@ int main(int argc, char* argv[])
             }
             else
             {
-                // Câmera em 3ª pessoa: impedimos que ela atravesse as paredes
-                // externas (que ficam em |x|,|z| = 5).
-                camera_position_c.x = std::max(-4.6f, std::min(4.6f, camera_position_c.x));
-                camera_position_c.z = std::max(-4.6f, std::min(4.6f, camera_position_c.z));
+                // Câmera em 3ª pessoa, às costas do jogador.
+                //
+                // 'forward' é a direção para onde o jogador está virado. A
+                // câmera fica no sentido oposto (-forward), elevada pelo
+                // ângulo phi: back = -forward*cos(phi) + up*sin(phi).
+                const glm::vec3 forward(sin(g_PlayerYaw), 0.0f, cos(g_PlayerYaw));
+                const glm::vec3 up(0.0f, 1.0f, 0.0f);
+                const glm::vec3 back = -forward*cosf(g_CameraPhi) + up*sinf(g_CameraPhi);
+
+                // Ponto de referência: a cabeça do jogador (mais baixa se agachado).
+                const glm::vec3 head = g_PlayerPos + glm::vec3(0.0f, g_PlayerCrouching ? 0.6f : 0.9f, 0.0f);
+                const glm::vec3 ideal = head + back * g_CameraDistance;
+
+                // Suavização exponencial: a cada quadro a câmera percorre uma
+                // fração da distância até a posição ideal. Usar 1 - e^(-k*dt)
+                // faz o resultado não depender do FPS.
+                if (!g_FollowCameraInitialized)
+                {
+                    g_FollowCameraPos = ideal;
+                    g_FollowCameraInitialized = true;
+                }
+                const float alpha = 1.0f - expf(-CAMERA_SMOOTHING * delta_t);
+                g_FollowCameraPos += (ideal - g_FollowCameraPos) * alpha;
+
+                // A câmera não pode atravessar paredes: lançamos um raio da
+                // cabeça do jogador até a câmera; se ele bate em alguma parede
+                // antes, aproximamos a câmera para logo antes da parede.
+                glm::vec3 cam = g_FollowCameraPos;
+                glm::vec3 to_cam = cam - head;
+                const float cam_dist = glm::length(to_cam);
+                if (cam_dist > 1e-4f)
+                {
+                    const glm::vec3 dir = to_cam / cam_dist;
+                    float t_hit;
+                    if (RayHitsColliders(head, dir, cam_dist, t_hit))
+                        cam = head + dir * std::max(0.3f, t_hit - 0.25f);
+                }
+
+                // A câmera olha um pouco à frente do jogador, assim ele fica na
+                // parte de baixo da tela e enxergamos o caminho adiante.
+                const glm::vec3 look = head + forward * 1.5f;
+
+                camera_position_c = glm::vec4(cam, 1.0f);
+                camera_lookat_l   = glm::vec4(look, 1.0f);
             }
         }
         glm::vec4 camera_view_vector = camera_lookat_l - camera_position_c; // Vetor "view", sentido para onde a câmera está virada
@@ -584,7 +644,7 @@ int main(int argc, char* argv[])
             const float s = 0.35f;
             const float crouch = g_PlayerCrouching ? 0.6f : 1.0f;
             model = Matrix_Translate(g_PlayerPos.x, g_PlayerPos.y + 0.05f + 0.99f*s*crouch, g_PlayerPos.z)
-                  * Matrix_Rotate_Y(g_PlayerYaw)
+                  * Matrix_Rotate_Y(g_PlayerYaw + PLAYER_MODEL_YAW_OFFSET)
                   * Matrix_Scale(s, s*crouch, s);
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
             glUniform1i(g_object_id_uniform, BUNNY);
@@ -621,11 +681,14 @@ int main(int argc, char* argv[])
             {
                 float pad = TextRendering_LineHeight(window);
                 TextRendering_PrintString(window,
-                    "WASD: mover | botao esquerdo + mouse: girar camera | C: agachar | M: mapa | H: ocultar",
+                    "WASD: mover | setas ou botao esq. + mouse: virar | roda: zoom",
                     -1.0f + pad/10, 1.0f - pad, 1.0f);
                 TextRendering_PrintString(window,
-                    g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
+                    "C: agachar | M: mapa | H: ocultar ajuda",
                     -1.0f + pad/10, 1.0f - 2*pad, 1.0f);
+                TextRendering_PrintString(window,
+                    g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
+                    -1.0f + pad/10, 1.0f - 3*pad, 1.0f);
             }
         }
         else
@@ -1329,7 +1392,22 @@ void CursorPosCallback(GLFWwindow* window, double xpos, double ypos)
     // parâmetros que definem a posição da câmera dentro da cena virtual.
     // Assim, temos que o usuário consegue controlar a câmera.
 
-    if (g_LeftMouseButtonPressed)
+    if (g_LeftMouseButtonPressed && g_DungeonMode)
+    {
+        // Na masmorra, arrastar o mouse na horizontal vira o jogador (e a
+        // câmera, que está sempre às costas dele); na vertical, sobe/desce a
+        // câmera.
+        float dx = xpos - g_LastCursorPosX;
+        float dy = ypos - g_LastCursorPosY;
+
+        g_PlayerYaw -= MOUSE_TURN_SENSITIVITY * dx;
+        g_CameraPhi += 0.004f * dy;
+        g_CameraPhi  = std::max(CAMERA_MIN_PHI, std::min(CAMERA_MAX_PHI, g_CameraPhi));
+
+        g_LastCursorPosX = xpos;
+        g_LastCursorPosY = ypos;
+    }
+    else if (g_LeftMouseButtonPressed)
     {
         // Deslocamento do cursor do mouse em x e y de coordenadas de tela!
         float dx = xpos - g_LastCursorPosX;
@@ -1403,6 +1481,10 @@ void ScrollCallback(GLFWwindow* window, double xoffset, double yoffset)
     const float verysmallnumber = std::numeric_limits<float>::epsilon();
     if (g_CameraDistance < verysmallnumber)
         g_CameraDistance = verysmallnumber;
+
+    // Na masmorra, limitamos o zoom da câmera em 3ª pessoa.
+    if (g_DungeonMode)
+        g_CameraDistance = std::max(CAMERA_MIN_DISTANCE, std::min(CAMERA_MAX_DISTANCE, g_CameraDistance));
 }
 
 void Correcao_KeyCallback(int key, int action, int mod);
@@ -1885,16 +1967,36 @@ bool PlayerCollides(glm::vec3 p)
     return false;
 }
 
-// Lê o teclado e move o jogador. O movimento é relativo à câmera (W = para
-// longe da câmera) e proporcional a delta_t.
+// Testa um raio contra todas as caixas de colisão da masmorra. Devolve true se
+// ele atinge alguma antes da distância max_t; t_hit recebe a mais próxima.
+bool RayHitsColliders(glm::vec3 origin, glm::vec3 dir, float max_t, float& t_hit)
+{
+    bool hit = false;
+    t_hit = max_t;
+    for (const AABB& box : g_Colliders)
+    {
+        float t;
+        if (Ray_AABB(origin, dir, box, t) && t < t_hit)
+        {
+            t_hit = t;
+            hit = true;
+        }
+    }
+    return hit;
+}
+
+// Lê o teclado e move o jogador. Controles "de jogo em 3ª pessoa": o jogador
+// tem uma direção (g_PlayerYaw); W/S andam para frente/trás nessa direção,
+// A/D andam de lado, e as setas (ou o mouse) giram o jogador. Tudo é
+// proporcional a delta_t.
 void UpdatePlayer(GLFWwindow* window, float delta_t)
 {
-    // Na câmera de mapa, "para cima" na tela é -Z (equivale a theta = 0).
-    const float theta = g_TopDownCamera ? 0.0f : g_CameraTheta;
+    if (glfwGetKey(window, GLFW_KEY_LEFT)  == GLFW_PRESS) g_PlayerYaw += PLAYER_TURN_SPEED * delta_t;
+    if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) g_PlayerYaw -= PLAYER_TURN_SPEED * delta_t;
 
-    // Direções "frente" e "direita" da câmera, projetadas no plano XZ.
-    const glm::vec3 forward(-sin(theta), 0.0f, -cos(theta));
-    const glm::vec3 right  ( cos(theta), 0.0f, -sin(theta));
+    // "Frente" do jogador e "direita" (frente x up), no plano XZ.
+    const glm::vec3 forward(sin(g_PlayerYaw), 0.0f, cos(g_PlayerYaw));
+    const glm::vec3 right  (-cos(g_PlayerYaw), 0.0f, sin(g_PlayerYaw));
 
     glm::vec3 direction(0.0f);
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) direction += forward;
@@ -1908,7 +2010,6 @@ void UpdatePlayer(GLFWwindow* window, float delta_t)
         return;
 
     direction = glm::normalize(direction);
-    g_PlayerYaw = atan2(direction.x, direction.z); // vira o personagem para onde anda
 
     const float speed = g_PlayerCrouching ? PLAYER_SPEED_CROUCH : PLAYER_SPEED;
     const glm::vec3 step = direction * speed * delta_t;
