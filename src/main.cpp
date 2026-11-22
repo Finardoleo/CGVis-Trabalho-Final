@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 // Headers abaixo são específicos de C++
 #include <set>
@@ -204,8 +205,8 @@ bool  g_DungeonMode   = false;                        // false = cena antiga (--
 // (g_FollowCameraPos persegue a posição ideal) para não ficar "grudada".
 glm::vec3 g_FollowCameraPos = glm::vec3(0.0f);
 bool      g_FollowCameraInitialized = false;
-const float CAMERA_MIN_DISTANCE = 1.5f;
-const float CAMERA_MAX_DISTANCE = 7.0f;
+const float CAMERA_MIN_DISTANCE = 2.0f;
+const float CAMERA_MAX_DISTANCE = 9.0f;
 const float CAMERA_MIN_PHI      = 0.05f;  // quase na altura do ombro
 const float CAMERA_MAX_PHI      = 1.30f;  // quase vertical
 const float CAMERA_SMOOTHING    = 10.0f;  // maior = acompanha mais rápido
@@ -214,12 +215,50 @@ const float MOUSE_TURN_SENSITIVITY = 0.006f;
 
 // Rotação extra aplicada só ao desenhar o modelo, para que a "frente" do
 // modelo .obj coincida com a direção para onde o jogador anda.
-const float PLAYER_MODEL_YAW_OFFSET = 3.141592f/2.0f; // o coelho olha para -X
+const float PLAYER_MODEL_YAW_OFFSET = 0.0f; // o ladrão já olha para +Z
 
 const float PLAYER_SPEED        = 3.5f; // unidades por segundo
 const float PLAYER_SPEED_CROUCH = 1.5f;
-const float PLAYER_HALF_SIZE    = 0.35f; // meia largura da caixa de colisão
-const float PLAYER_HEIGHT       = 1.0f;
+const float PLAYER_HALF_SIZE    = 0.4f;  // meia largura da caixa de colisão
+const float PLAYER_HEIGHT       = 1.6f;
+const float PLAYER_MODEL_SCALE  = 0.72f; // o modelo do ladrão tem 2.24 de altura
+
+// O labirinto é uma grade de células de CELL_SIZE x CELL_SIZE (o tamanho do
+// piso e do painel de parede do KayKit). Ele é descrito por um "desenho" em
+// texto, uma linha por fileira de células (eixo Z) e uma coluna por célula
+// (eixo X):
+//   '#' parede        '.' chão          'S' início do jogador
+//   'E' saída         'c' caixote (dá para se esconder agachado)
+//   'b' barril        'B' baú           'K' chave      '$' tesouro
+const float CELL_SIZE = 4.0f;
+const char* DUNGEON_MAP[] = {
+    "#################",
+    "#S..#.....#.....#",
+    "###.#.###.#.###.#",
+    "#...#...#...#...#",
+    "#.#####.#####.###",
+    "#.#.........#...#",
+    "#.#..c.$.c..#.#.#",
+    "#.#....K....#.#.#",
+    "#...b.......###.#",
+    "####.####.#.....#",
+    "#..c.#B..b#.###.#",
+    "#K#.....#.#..$E.#",
+    "#################",
+};
+const int MAP_ROWS = sizeof(DUNGEON_MAP) / sizeof(DUNGEON_MAP[0]);
+int MapCols() { return (int)strlen(DUNGEON_MAP[0]); }
+char MapAt(int row, int col)
+{
+    if (row < 0 || row >= MAP_ROWS || col < 0 || col >= MapCols()) return '#';
+    return DUNGEON_MAP[row][col];
+}
+// Centro da célula (row, col) no mundo.
+glm::vec3 CellCenter(int row, int col) { return glm::vec3(col * CELL_SIZE, 0.0f, row * CELL_SIZE); }
+
+// Névoa: a cor final se mistura com a cor do fundo conforme a distância.
+const float FOG_DENSITY = 0.055f;
+const glm::vec3 FOG_COLOR(0.02f, 0.02f, 0.03f);
 
 void BuildDungeon();
 bool PlayerCollides(glm::vec3 feet_position);
@@ -277,6 +316,8 @@ GLint g_light_positions_uniform;
 GLint g_light_colors_uniform;
 GLint g_light_count_uniform;
 GLint g_ambient_strength_uniform;
+GLint g_fog_density_uniform;
+GLint g_fog_color_uniform;
 
 // Número de texturas carregadas pela função LoadTextureImage()
 GLuint g_NumLoadedTextures = 0;
@@ -366,33 +407,32 @@ int main(int argc, char* argv[])
 
     if (dungeon_preview)
     {
-        LoadTextureImage("../../data/kaykit_dungeon/dungeon_texture.png"); // TextureImage2
+        LoadTextureImage("../../data/kaykit_dungeon/dungeon_texture.png");    // TextureImage2
+        LoadTextureImage("../../data/kaykit_characters/rogue_texture.png");   // TextureImage3
 
-        ObjModel floor_model("../../data/kaykit_dungeon/floor_tile_large.obj");
-        ComputeNormals(&floor_model);
-        BuildTrianglesAndAddToVirtualScene(&floor_model);
+        // Todas as malhas da masmorra usam a mesma textura (TextureImage2).
+        const char* dungeon_models[] = {
+            "floor_tile_large", "wall", "chest", "torch_mounted", "box_large",
+            "crates_stacked", "barrel_small", "pillar", "coin_stack_large", "key",
+            "wall_doorway", "wall_doorway_door",
+        };
+        for (const char* name : dungeon_models)
+        {
+            std::string path = std::string("../../data/kaykit_dungeon/") + name + ".obj";
+            ObjModel model(path.c_str());
+            ComputeNormals(&model);
+            BuildTrianglesAndAddToVirtualScene(&model);
+        }
 
-        ObjModel wall_model("../../data/kaykit_dungeon/wall.obj");
-        ComputeNormals(&wall_model);
-        BuildTrianglesAndAddToVirtualScene(&wall_model);
-
-        ObjModel chest_model("../../data/kaykit_dungeon/chest.obj");
-        ComputeNormals(&chest_model);
-        BuildTrianglesAndAddToVirtualScene(&chest_model);
-
-        ObjModel torch_model("../../data/kaykit_dungeon/torch_mounted.obj");
-        ComputeNormals(&torch_model);
-        BuildTrianglesAndAddToVirtualScene(&torch_model);
-
-        // Personagem provisório do jogador (trocar pelo modelo do ladrão).
-        ObjModel player_model("../../data/bunny.obj");
+        // O ladrão (personagem do jogador).
+        ObjModel player_model("../../data/kaykit_characters/rogue.obj");
         ComputeNormals(&player_model);
         BuildTrianglesAndAddToVirtualScene(&player_model);
 
         BuildDungeon();
 
-        g_CameraDistance = 3.2f;
-        g_CameraPhi = 0.35f;
+        g_CameraDistance = 4.5f;
+        g_CameraPhi = 0.40f;
     }
     else
     {
@@ -457,7 +497,7 @@ int main(int argc, char* argv[])
         //
         //           R     G     B     A
         if (dungeon_preview)
-            glClearColor(0.02f, 0.02f, 0.03f, 1.0f); // fundo escuro de masmorra
+            glClearColor(FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z, 1.0f); // fundo escuro de masmorra
         else
             glClearColor(0.9f, 0.9f, 1.0f, 1.0f);
 
@@ -497,8 +537,9 @@ int main(int argc, char* argv[])
                 // Câmera de mapa: vista de cima, centrada na sala. Como a
                 // direção de visão é paralela ao eixo Y, o vetor "up" não pode
                 // ser Y; usamos -Z (o "topo" do mapa é o norte da masmorra).
-                camera_lookat_l   = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-                camera_position_c = glm::vec4(0.0f, 17.0f, 0.0f, 1.0f);
+                // Ela acompanha o jogador, para funcionar em todo o labirinto.
+                camera_lookat_l   = glm::vec4(g_PlayerPos.x, 0.0f, g_PlayerPos.z, 1.0f);
+                camera_position_c = glm::vec4(g_PlayerPos.x, 30.0f, g_PlayerPos.z, 1.0f);
                 camera_up_vector  = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
             }
             else
@@ -513,7 +554,7 @@ int main(int argc, char* argv[])
                 const glm::vec3 back = -forward*cosf(g_CameraPhi) + up*sinf(g_CameraPhi);
 
                 // Ponto de referência: a cabeça do jogador (mais baixa se agachado).
-                const glm::vec3 head = g_PlayerPos + glm::vec3(0.0f, g_PlayerCrouching ? 0.6f : 0.9f, 0.0f);
+                const glm::vec3 head = g_PlayerPos + glm::vec3(0.0f, g_PlayerCrouching ? 1.0f : 1.45f, 0.0f);
                 const glm::vec3 ideal = head + back * g_CameraDistance;
 
                 // Suavização exponencial: a cada quadro a câmera percorre uma
@@ -561,7 +602,7 @@ int main(int argc, char* argv[])
         // Note que, no sistema de coordenadas da câmera, os planos near e far
         // estão no sentido negativo! Veja slides 176-204 do documento Aula_09_Projecoes.pdf.
         float nearplane = -0.1f;  // Posição do "near plane"
-        float farplane  = dungeon_preview ? -50.0f : -10.0f; // Posição do "far plane"
+        float farplane  = dungeon_preview ? -150.0f : -10.0f; // Posição do "far plane"
 
         if (g_UsePerspectiveProjection)
         {
@@ -599,14 +640,27 @@ int main(int argc, char* argv[])
 
         if (dungeon_preview)
         {
-            for (size_t i = 0; i < g_TorchLights.size() && i < 8; ++i)
+            // O shader aceita até 8 luzes; usamos as 8 tochas mais próximas
+            // do jogador (as distantes quase não contribuem, por causa da
+            // atenuação e da névoa).
+            std::vector<int> order(g_TorchLights.size());
+            for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
+            std::sort(order.begin(), order.end(), [](int a, int b) {
+                return glm::length(g_TorchLights[a] - g_PlayerPos) < glm::length(g_TorchLights[b] - g_PlayerPos);
+            });
+
+            for (size_t k = 0; k < order.size() && k < 8; ++k)
             {
-                light_positions[i][0] = g_TorchLights[i].x;
-                light_positions[i][1] = g_TorchLights[i].y;
-                light_positions[i][2] = g_TorchLights[i].z;
-                light_colors[i][0] = 3.0f; // cor quente de fogo
-                light_colors[i][1] = 1.45f;
-                light_colors[i][2] = 0.55f;
+                const int i = order[k];
+                // Tremulação do fogo: intensidade varia com o tempo (cada
+                // tocha com uma fase diferente).
+                const float flicker = 0.85f + 0.15f * sinf(current_time*9.0f + i*1.7f) * sinf(current_time*3.7f + i*0.6f);
+                light_positions[k][0] = g_TorchLights[i].x;
+                light_positions[k][1] = g_TorchLights[i].y;
+                light_positions[k][2] = g_TorchLights[i].z;
+                light_colors[k][0] = 3.2f * flicker; // cor quente de fogo
+                light_colors[k][1] = 1.5f * flicker;
+                light_colors[k][2] = 0.55f * flicker;
                 ++light_count;
             }
         }
@@ -620,12 +674,17 @@ int main(int argc, char* argv[])
         glUniform3fv(g_light_positions_uniform, 8, &light_positions[0][0]);
         glUniform3fv(g_light_colors_uniform, 8, &light_colors[0][0]);
         glUniform1i(g_light_count_uniform, light_count);
-        glUniform1f(g_ambient_strength_uniform, dungeon_preview ? 0.16f : 0.2f);
+        glUniform1f(g_ambient_strength_uniform, dungeon_preview ? 0.07f : 0.2f);
+
+        // Névoa só na masmorra e fora da câmera de mapa.
+        glUniform1f(g_fog_density_uniform, (dungeon_preview && !g_TopDownCamera) ? FOG_DENSITY : 0.0f);
+        glUniform3f(g_fog_color_uniform, FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z);
 
         #define SPHERE 0
         #define BUNNY  1
         #define PLANE  2
         #define DUNGEON_OBJECT 3
+        #define ROGUE 4
 
         if (dungeon_preview)
         {
@@ -641,14 +700,15 @@ int main(int argc, char* argv[])
             // Desenhamos o jogador. A Model matrix é: levar para a posição do
             // jogador (T) * virar para onde ele anda (R) * reduzir o modelo (S).
             // Ao agachar, achatamos o modelo em Y.
-            const float s = 0.35f;
-            const float crouch = g_PlayerCrouching ? 0.6f : 1.0f;
-            model = Matrix_Translate(g_PlayerPos.x, g_PlayerPos.y + 0.05f + 0.99f*s*crouch, g_PlayerPos.z)
+            // Os pés do modelo do ladrão estão em y = 0 (coordenadas do modelo).
+            const float s = PLAYER_MODEL_SCALE;
+            const float crouch = g_PlayerCrouching ? 0.65f : 1.0f;
+            model = Matrix_Translate(g_PlayerPos.x, g_PlayerPos.y + 0.05f, g_PlayerPos.z)
                   * Matrix_Rotate_Y(g_PlayerYaw + PLAYER_MODEL_YAW_OFFSET)
                   * Matrix_Scale(s, s*crouch, s);
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            glUniform1i(g_object_id_uniform, BUNNY);
-            DrawVirtualObject("the_bunny");
+            glUniform1i(g_object_id_uniform, ROGUE);
+            DrawVirtualObject("rogue");
         }
         else
         {
@@ -858,12 +918,15 @@ void LoadShadersFromFiles()
     g_light_colors_uniform = glGetUniformLocation(g_GpuProgramID, "light_colors");
     g_light_count_uniform = glGetUniformLocation(g_GpuProgramID, "light_count");
     g_ambient_strength_uniform = glGetUniformLocation(g_GpuProgramID, "ambient_strength");
+    g_fog_density_uniform = glGetUniformLocation(g_GpuProgramID, "fog_density");
+    g_fog_color_uniform   = glGetUniformLocation(g_GpuProgramID, "fog_color");
 
     // Variáveis em "shader_fragment.glsl" para acesso das imagens de textura
     glUseProgram(g_GpuProgramID);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage0"), 0);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage1"), 1);
     glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage2"), 2);
+    glUniform1i(glGetUniformLocation(g_GpuProgramID, "TextureImage3"), 3);
     glUseProgram(0);
 }
 
@@ -1886,11 +1949,9 @@ void PrintObjModelInfo(ObjModel* model)
 // em cada cópia (instância) é só a Model matrix.
 void BuildDungeon()
 {
-    const char* FLOOR = "floor_tile_large_Cube.13698";
-    const char* WALL  = "wall_Cube.13106";
-    const char* CHEST = "chest_Cube.11164";
-    const char* TORCH = "torch_mounted_Cylinder.334";
-    const float PI_2  = 1.570796f;
+    const float PI   = 3.141592f;
+    const float PI_2 = 1.570796f;
+    const float half = CELL_SIZE / 2.0f;
 
     // Adiciona uma instância; se 'collidable', também guarda a AABB dela
     // (em coordenadas do mundo) para os testes de colisão.
@@ -1908,48 +1969,122 @@ void BuildDungeon()
         }
     };
 
-    // Piso 3x3 e paredes externas (3 painéis de 4 unidades por lado).
-    for (int i = -1; i <= 1; ++i)
-    {
-        for (int j = -1; j <= 1; ++j)
-            add(FLOOR, Matrix_Translate(4.0f*i, 0.0f, 4.0f*j), false);
-
-        const float c = 4.0f * i;
-        add(WALL, Matrix_Translate(c, 0.0f, -5.5f), true);                          // norte
-        add(WALL, Matrix_Translate(c, 0.0f,  5.5f), true);                          // sul
-        add(WALL, Matrix_Translate(-5.5f, 0.0f, c) * Matrix_Rotate_Y( PI_2), true); // oeste
-        add(WALL, Matrix_Translate( 5.5f, 0.0f, c) * Matrix_Rotate_Y(-PI_2), true); // leste
-    }
-
-    // Mureta no meio da sala: a mesma malha de parede, achatada em Y (altura
-    // 4 * 0.35 = 1.4). Serve de obstáculo para colisão e para se esconder.
-    add(WALL, Matrix_Translate(-2.0f, 0.0f, 0.0f) * Matrix_Scale(1.0f, 0.35f, 1.0f), true);
-
-    // Baús.
-    add(CHEST, Matrix_Translate( 3.5f, 0.05f, -3.5f), true);
-    add(CHEST, Matrix_Translate(-3.5f, 0.05f,  3.5f) * Matrix_Rotate_Y(PI_2), true);
-    add(CHEST, Matrix_Translate( 3.5f, 0.05f,  3.0f) * Matrix_Rotate_Y(3.141592f), true);
-
-    // Tochas: ficam coladas na face interna das paredes, com a ponta voltada
-    // para dentro da sala. Cada tocha também gera uma luz pontual, um pouco à
-    // frente e acima dela (onde fica a chama).
-    auto add_torch = [&](float x, float z, float yaw)
-    {
-        glm::mat4 model = Matrix_Translate(x, 1.8f, z) * Matrix_Rotate_Y(yaw);
-        add(TORCH, model, false);
-
-        glm::vec3 dir(sin(yaw), 0.0f, cos(yaw)); // para onde a tocha aponta
-        g_TorchLights.push_back(glm::vec3(x, 2.3f, z) + 0.55f * dir);
+    // Vizinhos de uma célula: deslocamento (linha, coluna) e o ângulo (yaw)
+    // que aponta da parede vizinha para dentro da célula atual.
+    struct Neighbor { int dr, dc; float yaw_into_cell; };
+    const Neighbor neighbors[4] = {
+        {-1,  0, 0.0f},   // parede ao norte (-Z): olhar para +Z
+        { 1,  0, PI},     // parede ao sul   (+Z): olhar para -Z
+        { 0, -1, PI_2},   // parede a oeste  (-X): olhar para +X
+        { 0,  1, -PI_2},  // parede a leste  (+X): olhar para -X
     };
 
-    add_torch(-3.0f, -5.2f, 0.0f);
-    add_torch( 3.0f, -5.2f, 0.0f);
-    add_torch(-3.0f,  5.2f, 3.141592f);
-    add_torch( 3.0f,  5.2f, 3.141592f);
-    add_torch(-5.2f, -3.0f,  PI_2);
-    add_torch(-5.2f,  3.0f,  PI_2);
-    add_torch( 5.2f, -3.0f, -PI_2);
-    add_torch( 5.2f,  3.0f, -PI_2);
+    for (int r = 0; r < MAP_ROWS; ++r)
+    for (int c = 0; c < MapCols(); ++c)
+    {
+        const char cell = MapAt(r, c);
+        const glm::vec3 center = CellCenter(r, c);
+
+        if (cell == '#')
+        {
+            // A parede inteira (célula 4x4x4) é uma caixa de colisão. Só
+            // guardamos as que encostam em algum chão (as outras nunca são
+            // alcançadas).
+            bool touches_floor = false;
+            for (const Neighbor& nb : neighbors)
+                if (MapAt(r + nb.dr, c + nb.dc) != '#') touches_floor = true;
+            if (touches_floor)
+            {
+                AABB box;
+                box.min = center + glm::vec3(-half, 0.0f, -half);
+                box.max = center + glm::vec3( half, 4.0f,  half);
+                g_Colliders.push_back(box);
+            }
+            continue;
+        }
+
+        // Chão.
+        add("floor_tile_large_Cube.13698", Matrix_Translate(center.x, 0.0f, center.z), false);
+
+        // Paredes: para cada vizinho que é parede, um painel (4 de largura,
+        // 1 de espessura) na borda entre as duas células, com a espessura
+        // dentro da célula da parede. O painel do KayKit está ao longo de X;
+        // para as bordas leste/oeste, rotacionamos 90 graus.
+        int wall_count = 0;
+        bool exit_edge_skipped = false;
+        for (const Neighbor& nb : neighbors)
+        {
+            if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
+            ++wall_count;
+
+            // Na saída, a primeira parede vira um portal (desenhado abaixo).
+            if (cell == 'E' && !exit_edge_skipped) { exit_edge_skipped = true; continue; }
+
+            const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
+            const glm::vec3 p = center + to_wall * (half + 0.5f);
+            const bool along_z = (nb.dc != 0);
+            add("wall_Cube.13106", Matrix_Translate(p.x, 0.0f, p.z) * Matrix_Rotate_Y(along_z ? PI_2 : 0.0f), false);
+        }
+
+        // Tochas: em algumas células (padrão fixo, para ficarem espalhadas),
+        // presas na primeira parede vizinha. Cada tocha gera uma luz pontual,
+        // um pouco à frente e acima dela (onde fica a chama).
+        if (wall_count > 0 && cell != 'E' && (r * 7 + c * 3) % 4 == 0)
+        {
+            for (const Neighbor& nb : neighbors)
+            {
+                if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
+                const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
+                const glm::vec3 p = center + to_wall * (half + 0.2f);
+                add("torch_mounted_Cylinder.334", Matrix_Translate(p.x, 1.8f, p.z) * Matrix_Rotate_Y(nb.yaw_into_cell), false);
+                g_TorchLights.push_back(glm::vec3(p.x, 2.3f, p.z) - to_wall * 0.55f);
+                break;
+            }
+        }
+
+        // Objetos dentro da célula.
+        const glm::mat4 at_center = Matrix_Translate(center.x, 0.0f, center.z);
+        switch (cell)
+        {
+        case 'S':
+            g_PlayerPos = center;
+            // Começa virado para o primeiro vizinho livre.
+            for (const Neighbor& nb : neighbors)
+                if (MapAt(r + nb.dr, c + nb.dc) != '#') { g_PlayerYaw = nb.yaw_into_cell + PI; break; }
+            break;
+        case 'c': // caixotes: uma caixa grande e uma pilha, para se esconder
+            add("box_large_Cube.14519", at_center * Matrix_Translate(-0.6f, 0.0f, 0.4f), true);
+            add("crates_stacked_Cube.023", at_center * Matrix_Translate(0.9f, 0.0f, -0.7f) * Matrix_Rotate_Y(0.4f), true);
+            break;
+        case 'b':
+            add("barrel_small_Cylinder.216", at_center * Matrix_Translate(-0.5f, 0.0f, 0.3f), true);
+            add("barrel_small_Cylinder.216", at_center * Matrix_Translate(0.6f, 0.0f, -0.4f), true);
+            break;
+        case 'B':
+            add("chest_Cube.11164", at_center * Matrix_Rotate_Y(0.3f), true);
+            break;
+        case '$':
+            add("coin_stack_large_Cube.022", at_center * Matrix_Scale(0.7f, 0.7f, 0.7f), false);
+            break;
+        case 'K':
+            // Chave flutuando (a lógica de coletar vem numa próxima parte).
+            add("key_Torus.035", at_center * Matrix_Translate(-0.25f, 1.0f, 0.0f) * Matrix_Rotate_Z(PI_2), false);
+            break;
+        case 'E':
+            // Saída: um portal com porta na parede vizinha.
+            for (const Neighbor& nb : neighbors)
+            {
+                if (MapAt(r + nb.dr, c + nb.dc) != '#') continue;
+                const glm::vec3 to_wall((float)nb.dc, 0.0f, (float)nb.dr);
+                const glm::vec3 p = center + to_wall * (half + 0.5f);
+                const glm::mat4 m = Matrix_Translate(p.x, 0.0f, p.z) * Matrix_Rotate_Y(nb.dc != 0 ? PI_2 : 0.0f);
+                add("wall_doorway_Cube.13132", m, false);
+                add("wall_doorway_door_Cube.13134", m, false);
+                break;
+            }
+            break;
+        }
+    }
 }
 
 // Teste de colisão do jogador: monta a AABB do jogador (centrada em 'p', com os

@@ -23,6 +23,7 @@ uniform mat4 projection;
 #define BUNNY  1
 #define PLANE  2
 #define DUNGEON_OBJECT 3
+#define ROGUE 4
 uniform int object_id;
 
 // Parâmetros da axis-aligned bounding box (AABB) do modelo
@@ -33,10 +34,15 @@ uniform vec4 bbox_max;
 uniform sampler2D TextureImage0;
 uniform sampler2D TextureImage1;
 uniform sampler2D TextureImage2;
+uniform sampler2D TextureImage3; // textura do ladrão
 uniform vec3 light_positions[8];
 uniform vec3 light_colors[8];
 uniform int light_count;
 uniform float ambient_strength;
+
+// Névoa exponencial: densidade (0 = desligada) e cor (a mesma do fundo).
+uniform float fog_density;
+uniform vec3  fog_color;
 
 // O valor de saída ("out") de um Fragment Shader é a cor final do fragmento.
 out vec4 color;
@@ -137,6 +143,10 @@ void main()
     {
         Kd0 = texture(TextureImage2, texcoords).rgb;
     }
+    else if ( object_id == ROGUE )
+    {
+        Kd0 = texture(TextureImage3, texcoords).rgb;
+    }
 
     vec3 surface_normal = normalize(normal.xyz);
     vec3 view_direction = normalize(camera_position.xyz - p.xyz);
@@ -161,6 +171,14 @@ void main()
     }
 
     color.rgb = lighting;
+
+    // Névoa: quanto mais longe da câmera, mais a cor se aproxima da cor da
+    // névoa. Fator f = exp(-(densidade * distância)^2), entre 0 e 1. A cor da
+    // névoa vem em sRGB (igual à cor de fundo), então a convertemos para o
+    // espaço linear antes de misturar (a correção gamma é aplicada no final).
+    float fog_distance = length(camera_position.xyz - p.xyz);
+    float fog_factor = exp(-pow(fog_density * fog_distance, 2.0));
+    color.rgb = mix(pow(fog_color, vec3(2.2)), color.rgb, fog_factor);
 
     // NOTE: Se você quiser fazer o rendering de objetos transparentes, é
     // necessário:
