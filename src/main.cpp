@@ -190,6 +190,11 @@ struct Instance
     std::string mesh;
     glm::mat4   model;
     bool        visible = true; // itens coletados deixam de ser desenhados
+
+    // Material (termo especular de Phong): intensidade Ks e expoente q.
+    // O chão é "glossy" (brilhante, reflete as tochas); o resto é fosco.
+    float       specular  = 0.22f;
+    float       shininess = 32.0f;
 };
 
 std::vector<Instance>  g_Instances;   // Tudo que é desenhado na masmorra
@@ -498,6 +503,8 @@ GLint g_light_colors_uniform;
 GLint g_light_count_uniform;
 GLint g_ambient_strength_uniform;
 GLint g_fog_density_uniform;
+GLint g_specular_uniform;
+GLint g_shininess_uniform;
 GLint g_fog_color_uniform;
 
 // Número de texturas carregadas pela função LoadTextureImage()
@@ -924,6 +931,10 @@ int main(int argc, char* argv[])
         glUniform1i(g_light_count_uniform, light_count);
         glUniform1f(g_ambient_strength_uniform, dungeon_preview ? 0.07f : 0.2f);
 
+        // Material padrão (cada instância da masmorra pode sobrescrever).
+        glUniform1f(g_specular_uniform, 0.22f);
+        glUniform1f(g_shininess_uniform, 32.0f);
+
         // Névoa só na masmorra e fora da câmera de mapa.
         glUniform1f(g_fog_density_uniform, (dungeon_preview && !g_TopDownCamera) ? FOG_DENSITY : 0.0f);
         glUniform3f(g_fog_color_uniform, FOG_COLOR.x, FOG_COLOR.y, FOG_COLOR.z);
@@ -955,8 +966,13 @@ int main(int argc, char* argv[])
             {
                 if (!inst.visible) continue;
                 glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(inst.model));
+                glUniform1f(g_specular_uniform, inst.specular);
+                glUniform1f(g_shininess_uniform, inst.shininess);
                 DrawVirtualObject(inst.mesh.c_str());
             }
+            // Personagens, cajado etc.: material padrão (fosco).
+            glUniform1f(g_specular_uniform, 0.22f);
+            glUniform1f(g_shininess_uniform, 32.0f);
 
             // Desenhamos o jogador. A Model matrix é: levar para a posição do
             // jogador (T) * virar para onde ele anda (R) * reduzir o modelo (S).
@@ -1301,6 +1317,8 @@ void LoadShadersFromFiles()
     g_ambient_strength_uniform = glGetUniformLocation(g_GpuProgramID, "ambient_strength");
     g_fog_density_uniform = glGetUniformLocation(g_GpuProgramID, "fog_density");
     g_fog_color_uniform   = glGetUniformLocation(g_GpuProgramID, "fog_color");
+    g_specular_uniform    = glGetUniformLocation(g_GpuProgramID, "specular_strength");
+    g_shininess_uniform   = glGetUniformLocation(g_GpuProgramID, "shininess");
     g_cone_color_uniform  = glGetUniformLocation(g_GpuProgramID, "cone_color");
     g_tint_uniform        = glGetUniformLocation(g_GpuProgramID, "tint");
 
@@ -2434,9 +2452,14 @@ void BuildDungeon()
 
         const bool treasure_room = IsTreasureRoom(r, c);
 
-        // Chão (na sala do tesouro, de madeira escura).
+        // Chão (na sala do tesouro, de madeira escura). O piso de pedra é
+        // brilhante (glossy), como na referência: termo especular de Phong
+        // forte e concentrado (expoente alto), refletindo as tochas. A
+        // madeira encerada brilha um pouco menos.
         add(treasure_room ? "floor_wood_large_dark_Cube.159" : "floor_tile_large_Cube.13698",
             Matrix_Translate(center.x, 0.0f, center.z), false);
+        g_Instances.back().specular  = treasure_room ? 1.0f : 2.0f;
+        g_Instances.back().shininess = treasure_room ? 30.0f : 40.0f;
 
         // Paredes: para cada vizinho que é parede, um painel (4 de largura,
         // 1 de espessura) na borda entre as duas células, com a espessura
@@ -2552,7 +2575,7 @@ void BuildDungeon()
         case 'K':
         {
             // A chave flutua e gira (animada em UpdateObjectives).
-            // (1.6x maior que o modelo original, para ser fácil de ver.)
+            // (escala 1.6: a chave precisa se destacar no labirinto escuro.)
             const glm::mat4 m = at_center * Matrix_Translate(0.0f, 1.1f, 0.0f) * Matrix_Scale(1.6f, 1.6f, 1.6f);
             add("key_Torus.035", m, false);
             g_Pickups.push_back({ (int)g_Instances.size() - 1, m, center, true, false });
@@ -2562,8 +2585,9 @@ void BuildDungeon()
         {
             // Portão da sala do tesouro: grade atravessando o corredor. Se o
             // corredor vai na direção Z (vizinhos norte/sul livres), a grade
-            // fica ao longo de X; senão, girada 90 graus. Por enquanto fica
-            // sempre fechado (é uma caixa de colisão).
+            // fica ao longo de X; senão, girada 90 graus. Fechado, é uma
+            // caixa de colisão; abre (sobe) quando o jogador chega com a
+            // chave (veja UpdateObjectives).
             const bool corridor_along_z = MapAt(r - 1, c) != '#' && MapAt(r + 1, c) != '#';
             Gate gate;
             gate.base_model = at_center * Matrix_Rotate_Y(corridor_along_z ? 0.0f : PI_2);

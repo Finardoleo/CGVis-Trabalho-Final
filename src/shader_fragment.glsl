@@ -45,6 +45,10 @@ uniform vec3 light_colors[8];
 uniform int light_count;
 uniform float ambient_strength;
 
+// Material: intensidade (Ks) e expoente (q) do termo especular de Phong.
+uniform float specular_strength;
+uniform float shininess;
+
 // Névoa exponencial: densidade (0 = desligada) e cor (a mesma do fundo).
 uniform float fog_density;
 uniform vec3  fog_color;
@@ -191,8 +195,9 @@ void main()
         vec3 diffuse = Kd0 * light_colors[i] * diffuse_strength;
 
         vec3 reflected_direction = reflect(-light_direction, surface_normal);
-        float specular_strength = pow(max(dot(view_direction, reflected_direction), 0.0), 32.0);
-        vec3 specular = 0.22 * light_colors[i] * specular_strength;
+        // Termo especular de Phong: Ks * I * (r . v)^q.
+        float phong = pow(max(dot(view_direction, reflected_direction), 0.0), shininess);
+        vec3 specular = specular_strength * light_colors[i] * phong;
 
         lighting += attenuation * (diffuse + specular);
     }
