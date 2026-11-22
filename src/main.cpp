@@ -48,6 +48,7 @@
 // Headers locais, definidos na pasta "include/"
 #include "utils.h"
 #include "matrices.h"
+#include "collisions.h"
 
 // Estrutura que representa um modelo geométrico carregado a partir de um
 // arquivo ".obj". Veja https://en.wikipedia.org/wiki/Wavefront_.obj_file .
@@ -128,6 +129,7 @@ void PrintObjModelInfo(ObjModel*); // Função para debugging
 // Declaração de funções auxiliares para renderizar texto dentro da janela
 // OpenGL. Estas funções estão definidas no arquivo "textrendering.cpp".
 void TextRendering_Init();
+void TextRendering_SetColor(float r, float g, float b); // Cor do texto (padrão: preto)
 float TextRendering_LineHeight(GLFWwindow* window);
 float TextRendering_CharWidth(GLFWwindow* window);
 void TextRendering_PrintString(GLFWwindow* window, const std::string &str, float x, float y, float scale = 1.0f);
@@ -173,6 +175,37 @@ struct SceneObject
 // objetos dentro da variável g_VirtualScene, e veja na função main() como
 // estes são acessados.
 std::map<std::string, SceneObject> g_VirtualScene;
+
+// ---------------------------------------------------------------------------
+// Estado da masmorra / jogo
+// ---------------------------------------------------------------------------
+
+// Uma instância é um objeto desenhado na cena: o nome da malha (que fica em
+// g_VirtualScene) e a Model matrix que posiciona esta cópia no mundo.
+// Várias instâncias compartilham a mesma malha (ex.: todas as paredes).
+struct Instance
+{
+    std::string mesh;
+    glm::mat4   model;
+};
+
+std::vector<Instance>  g_Instances;   // Tudo que é desenhado na masmorra
+std::vector<AABB>      g_Colliders;   // Caixas de colisão (paredes, baús)
+std::vector<glm::vec3> g_TorchLights; // Posição da luz de cada tocha
+
+glm::vec3 g_PlayerPos = glm::vec3(0.0f, 0.0f, -3.0f); // Pés do jogador
+float g_PlayerYaw     = 0.0f;                         // Rotação em Y
+bool  g_PlayerCrouching = false;
+bool  g_TopDownCamera = false;                        // Tecla M alterna
+
+const float PLAYER_SPEED        = 3.5f; // unidades por segundo
+const float PLAYER_SPEED_CROUCH = 1.5f;
+const float PLAYER_HALF_SIZE    = 0.35f; // meia largura da caixa de colisão
+const float PLAYER_HEIGHT       = 1.0f;
+
+void BuildDungeon();
+bool PlayerCollides(glm::vec3 feet_position);
+void UpdatePlayer(GLFWwindow* window, float delta_t);
 
 // Pilha que guardará as matrizes de modelagem.
 std::stack<glm::mat4>  g_MatrixStack;
@@ -231,8 +264,10 @@ GLuint g_NumLoadedTextures = 0;
 
 int main(int argc, char* argv[])
 {
+    // A masmorra é a cena padrão. Para ver a cena antiga do laboratório (esfera,
+    // coelho e plano), execute com o argumento --lab.
     const bool dungeon_preview =
-        argc > 1 && std::string(argv[1]) == "--dungeon-preview";
+        !(argc > 1 && std::string(argv[1]) == "--lab");
 
     // Inicializamos a biblioteca GLFW, utilizada para criar uma janela do
     // sistema operacional, onde poderemos renderizar com OpenGL.
@@ -259,9 +294,9 @@ int main(int argc, char* argv[])
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
     // Criamos uma janela do sistema operacional, com 800 colunas e 600 linhas
-    // de pixels, e com título "INF01047 ...".
+    // de pixels, e com título "Masmorra Stealth 3D".
     GLFWwindow* window;
-    window = glfwCreateWindow(800, 600, "INF01047 - Seu Cartao - Seu Nome", NULL, NULL);
+    window = glfwCreateWindow(800, 600, "Masmorra Stealth 3D", NULL, NULL);
     if (!window)
     {
         glfwTerminate();
@@ -329,8 +364,15 @@ int main(int argc, char* argv[])
         ComputeNormals(&torch_model);
         BuildTrianglesAndAddToVirtualScene(&torch_model);
 
-        g_CameraDistance = 8.0f;
-        g_CameraPhi = 0.55f;
+        // Personagem provisório do jogador (trocar pelo modelo do ladrão).
+        ObjModel player_model("../../data/bunny.obj");
+        ComputeNormals(&player_model);
+        BuildTrianglesAndAddToVirtualScene(&player_model);
+
+        BuildDungeon();
+
+        g_CameraDistance = 5.0f;
+        g_CameraPhi = 0.6f;
     }
     else
     {
@@ -347,7 +389,7 @@ int main(int argc, char* argv[])
         ComputeNormals(&planemodel);
         BuildTrianglesAndAddToVirtualScene(&planemodel);
 
-        if (argc > 1)
+        if (argc > 1 && std::string(argv[1]) != "--lab")
         {
             ObjModel model(argv[1]);
             ComputeNormals(&model);
@@ -357,6 +399,8 @@ int main(int argc, char* argv[])
 
     // Inicializamos o código para renderização de texto.
     TextRendering_Init();
+    if (dungeon_preview)
+        TextRendering_SetColor(1.0f, 1.0f, 1.0f); // texto branco sobre fundo escuro
 
     // Habilitamos o Z-buffer. Veja slides 104-116 do documento Aula_09_Projecoes.pdf.
     glEnable(GL_DEPTH_TEST);
@@ -366,9 +410,24 @@ int main(int argc, char* argv[])
     glCullFace(GL_BACK);
     glFrontFace(GL_CCW);
 
+    // Instante do quadro anterior, usado para calcular o delta t entre quadros.
+    float prev_time = (float)glfwGetTime();
+
     // Ficamos em um loop infinito, renderizando, até que o usuário feche a janela
     while (!glfwWindowShouldClose(window))
     {
+        // Tempo decorrido desde o quadro anterior (delta t). Toda movimentação é
+        // multiplicada por delta_t, para que a velocidade seja a mesma
+        // independentemente da quantidade de quadros por segundo (FPS).
+        float current_time = (float)glfwGetTime();
+        float delta_t = current_time - prev_time;
+        prev_time = current_time;
+        if (delta_t > 0.1f) // evita "saltos" caso a janela fique parada por um tempo
+            delta_t = 0.1f;
+
+        if (dungeon_preview)
+            UpdatePlayer(window, delta_t);
+
         // Aqui executamos as operações de renderização
 
         // Definimos a cor do "fundo" do framebuffer como branco.  Tal cor é
@@ -377,7 +436,10 @@ int main(int argc, char* argv[])
         // Conversaremos sobre sistemas de cores nas aulas de Modelos de Iluminação.
         //
         //           R     G     B     A
-        glClearColor(0.9f, 0.9f, 1.0f, 1.0f);
+        if (dungeon_preview)
+            glClearColor(0.02f, 0.02f, 0.03f, 1.0f); // fundo escuro de masmorra
+        else
+            glClearColor(0.9f, 0.9f, 1.0f, 1.0f);
 
         // "Pintamos" todos os pixels do framebuffer com a cor definida acima,
         // e também resetamos todos os pixels do Z-buffer (depth buffer).
@@ -398,11 +460,36 @@ int main(int argc, char* argv[])
 
         // Abaixo definimos as varáveis que efetivamente definem a câmera virtual.
         // Veja slides 195-227 e 229-234 do documento Aula_08_Sistemas_de_Coordenadas.pdf.
-        const float camera_target_y = dungeon_preview ? 1.5f : 0.0f;
-        glm::vec4 camera_position_c  = glm::vec4(x,y + camera_target_y,z,1.0f); // Ponto "c", centro da câmera
-        glm::vec4 camera_lookat_l    = glm::vec4(0.0f,camera_target_y,0.0f,1.0f); // Ponto "l", para onde a câmera (look-at) estará sempre olhando
-        glm::vec4 camera_view_vector = camera_lookat_l - camera_position_c; // Vetor "view", sentido para onde a câmera está virada
+        // Alvo da câmera: na masmorra, o jogador (na altura do tronco); na cena
+        // antiga do laboratório, a origem.
+        const glm::vec3 camera_target = dungeon_preview
+            ? g_PlayerPos + glm::vec3(0.0f, 0.8f, 0.0f)
+            : glm::vec3(0.0f, 0.0f, 0.0f);
+
+        glm::vec4 camera_position_c  = glm::vec4(camera_target.x + x, camera_target.y + y, camera_target.z + z, 1.0f); // Ponto "c", centro da câmera
+        glm::vec4 camera_lookat_l    = glm::vec4(camera_target, 1.0f); // Ponto "l", para onde a câmera (look-at) estará sempre olhando
         glm::vec4 camera_up_vector   = glm::vec4(0.0f,1.0f,0.0f,0.0f); // Vetor "up" fixado para apontar para o "céu" (eito Y global)
+
+        if (dungeon_preview)
+        {
+            if (g_TopDownCamera)
+            {
+                // Câmera de mapa: vista de cima, centrada na sala. Como a
+                // direção de visão é paralela ao eixo Y, o vetor "up" não pode
+                // ser Y; usamos -Z (o "topo" do mapa é o norte da masmorra).
+                camera_lookat_l   = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+                camera_position_c = glm::vec4(0.0f, 17.0f, 0.0f, 1.0f);
+                camera_up_vector  = glm::vec4(0.0f, 0.0f, -1.0f, 0.0f);
+            }
+            else
+            {
+                // Câmera em 3ª pessoa: impedimos que ela atravesse as paredes
+                // externas (que ficam em |x|,|z| = 5).
+                camera_position_c.x = std::max(-4.6f, std::min(4.6f, camera_position_c.x));
+                camera_position_c.z = std::max(-4.6f, std::min(4.6f, camera_position_c.z));
+            }
+        }
+        glm::vec4 camera_view_vector = camera_lookat_l - camera_position_c; // Vetor "view", sentido para onde a câmera está virada
 
         // Computamos a matriz "View" utilizando os parâmetros da câmera para
         // definir o sistema de coordenadas da câmera.  Veja slides 2-14, 184-190 e 236-242 do documento Aula_08_Sistemas_de_Coordenadas.pdf.
@@ -445,35 +532,34 @@ int main(int argc, char* argv[])
         glUniformMatrix4fv(g_view_uniform       , 1 , GL_FALSE , glm::value_ptr(view));
         glUniformMatrix4fv(g_projection_uniform , 1 , GL_FALSE , glm::value_ptr(projection));
 
-        const GLfloat light_positions[4][3] = {
-            {-1.25f, 2.25f, -0.95f},
-            { 1.25f, 2.25f, -0.95f},
-            {-1.05f, 2.25f,  0.0f},
-            { 1.05f, 2.25f,  0.0f}
-        };
-        const GLfloat torch_light_colors[4][3] = {
-            {3.0f, 1.45f, 0.55f},
-            {3.0f, 1.45f, 0.55f},
-            {3.0f, 1.45f, 0.55f},
-            {3.0f, 1.45f, 0.55f}
-        };
-        const GLfloat default_light_position[4][3] = {
-            {2.0f, 3.0f, 2.0f},
-            {0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f}
-        };
-        const GLfloat default_light_color[4][3] = {
-            {1.0f, 1.0f, 1.0f},
-            {0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f},
-            {0.0f, 0.0f, 0.0f}
-        };
-        glUniform3fv(g_light_positions_uniform, 4,
-                     dungeon_preview ? &light_positions[0][0] : &default_light_position[0][0]);
-        glUniform3fv(g_light_colors_uniform, 4,
-                     dungeon_preview ? &torch_light_colors[0][0] : &default_light_color[0][0]);
-        glUniform1i(g_light_count_uniform, dungeon_preview ? 4 : 1);
+        // Luzes pontuais: na masmorra, uma por tocha; na cena antiga, uma só.
+        GLfloat light_positions[8][3] = {};
+        GLfloat light_colors[8][3]    = {};
+        int     light_count           = 0;
+
+        if (dungeon_preview)
+        {
+            for (size_t i = 0; i < g_TorchLights.size() && i < 8; ++i)
+            {
+                light_positions[i][0] = g_TorchLights[i].x;
+                light_positions[i][1] = g_TorchLights[i].y;
+                light_positions[i][2] = g_TorchLights[i].z;
+                light_colors[i][0] = 3.0f; // cor quente de fogo
+                light_colors[i][1] = 1.45f;
+                light_colors[i][2] = 0.55f;
+                ++light_count;
+            }
+        }
+        else
+        {
+            light_positions[0][0] = 2.0f; light_positions[0][1] = 3.0f; light_positions[0][2] = 2.0f;
+            light_colors[0][0] = light_colors[0][1] = light_colors[0][2] = 1.0f;
+            light_count = 1;
+        }
+
+        glUniform3fv(g_light_positions_uniform, 8, &light_positions[0][0]);
+        glUniform3fv(g_light_colors_uniform, 8, &light_colors[0][0]);
+        glUniform1i(g_light_count_uniform, light_count);
         glUniform1f(g_ambient_strength_uniform, dungeon_preview ? 0.16f : 0.2f);
 
         #define SPHERE 0
@@ -483,43 +569,26 @@ int main(int argc, char* argv[])
 
         if (dungeon_preview)
         {
+            // Desenhamos todas as instâncias da masmorra. Cada uma usa uma
+            // malha já carregada na GPU, mudando apenas a Model matrix.
             glUniform1i(g_object_id_uniform, DUNGEON_OBJECT);
+            for (const Instance& inst : g_Instances)
+            {
+                glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(inst.model));
+                DrawVirtualObject(inst.mesh.c_str());
+            }
 
-            model = Matrix_Identity();
+            // Desenhamos o jogador. A Model matrix é: levar para a posição do
+            // jogador (T) * virar para onde ele anda (R) * reduzir o modelo (S).
+            // Ao agachar, achatamos o modelo em Y.
+            const float s = 0.35f;
+            const float crouch = g_PlayerCrouching ? 0.6f : 1.0f;
+            model = Matrix_Translate(g_PlayerPos.x, g_PlayerPos.y + 0.05f + 0.99f*s*crouch, g_PlayerPos.z)
+                  * Matrix_Rotate_Y(g_PlayerYaw)
+                  * Matrix_Scale(s, s*crouch, s);
             glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("floor_tile_large_Cube.13698");
-
-            model = Matrix_Translate(0.0f, 0.0f, -1.5f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("wall_Cube.13106");
-
-            model = Matrix_Translate(-1.5f, 0.0f, 0.0f) * Matrix_Rotate_Y(1.570796f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("wall_Cube.13106");
-
-            model = Matrix_Translate(1.5f, 0.0f, 0.0f) * Matrix_Rotate_Y(-1.570796f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("wall_Cube.13106");
-
-            model = Matrix_Translate(0.0f, 0.05f, 0.5f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("chest_Cube.11164");
-
-            model = Matrix_Translate(-1.25f, 1.8f, -1.2f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("torch_mounted_Cylinder.334");
-
-            model = Matrix_Translate(1.25f, 1.8f, -1.2f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("torch_mounted_Cylinder.334");
-
-            model = Matrix_Translate(-1.5f, 1.8f, 0.0f) * Matrix_Rotate_Y(1.570796f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("torch_mounted_Cylinder.334");
-
-            model = Matrix_Translate(1.5f, 1.8f, 0.0f) * Matrix_Rotate_Y(-1.570796f);
-            glUniformMatrix4fv(g_model_uniform, 1, GL_FALSE, glm::value_ptr(model));
-            DrawVirtualObject("torch_mounted_Cylinder.334");
+            glUniform1i(g_object_id_uniform, BUNNY);
+            DrawVirtualObject("the_bunny");
         }
         else
         {
@@ -546,12 +615,28 @@ int main(int argc, char* argv[])
             DrawVirtualObject("the_plane");
         }
 
-        // Imprimimos na tela os ângulos de Euler que controlam a rotação do
-        // terceiro cubo.
-        TextRendering_ShowEulerAngles(window);
+        if (dungeon_preview)
+        {
+            if (g_ShowInfoText)
+            {
+                float pad = TextRendering_LineHeight(window);
+                TextRendering_PrintString(window,
+                    "WASD: mover | botao esquerdo + mouse: girar camera | C: agachar | M: mapa | H: ocultar",
+                    -1.0f + pad/10, 1.0f - pad, 1.0f);
+                TextRendering_PrintString(window,
+                    g_TopDownCamera ? "Camera: mapa (top-down)" : "Camera: 3a pessoa",
+                    -1.0f + pad/10, 1.0f - 2*pad, 1.0f);
+            }
+        }
+        else
+        {
+            // Imprimimos na tela os ângulos de Euler que controlam a rotação do
+            // terceiro cubo.
+            TextRendering_ShowEulerAngles(window);
 
-        // Imprimimos na informação sobre a matriz de projeção sendo utilizada.
-        TextRendering_ShowProjection(window);
+            // Imprimimos na informação sobre a matriz de projeção sendo utilizada.
+            TextRendering_ShowProjection(window);
+        }
 
         // Imprimimos na tela informação sobre o número de quadros renderizados
         // por segundo (frames per second).
@@ -1384,6 +1469,13 @@ void KeyCallback(GLFWwindow* window, int key, int scancode, int action, int mod)
         g_UsePerspectiveProjection = false;
     }
 
+    // Se o usuário apertar a tecla M, alternamos entre a câmera em 3ª pessoa
+    // e a câmera de mapa (vista de cima).
+    if (key == GLFW_KEY_M && action == GLFW_PRESS)
+    {
+        g_TopDownCamera = !g_TopDownCamera;
+    }
+
     // Se o usuário apertar a tecla H, fazemos um "toggle" do texto informativo mostrado na tela.
     if (key == GLFW_KEY_H && action == GLFW_PRESS)
     {
@@ -1704,3 +1796,132 @@ void PrintObjModelInfo(ObjModel* model)
 
 // set makeprg=cd\ ..\ &&\ make\ run\ >/dev/null
 // vim: set spell spelllang=pt_br :
+
+
+// Monta a masmorra: uma sala de 12x12 (3x3 pisos de 4x4), cercada por paredes,
+// com uma parede divisória, três baús e oito tochas. Note que há apenas UMA
+// malha de piso, UMA de parede, UMA de baú e UMA de tocha na GPU: o que muda
+// em cada cópia (instância) é só a Model matrix.
+void BuildDungeon()
+{
+    const char* FLOOR = "floor_tile_large_Cube.13698";
+    const char* WALL  = "wall_Cube.13106";
+    const char* CHEST = "chest_Cube.11164";
+    const char* TORCH = "torch_mounted_Cylinder.334";
+    const float PI_2  = 1.570796f;
+
+    // Adiciona uma instância; se 'collidable', também guarda a AABB dela
+    // (em coordenadas do mundo) para os testes de colisão.
+    auto add = [](const char* mesh, glm::mat4 model, bool collidable)
+    {
+        Instance inst;
+        inst.mesh  = mesh;
+        inst.model = model;
+        g_Instances.push_back(inst);
+
+        if (collidable)
+        {
+            const SceneObject& obj = g_VirtualScene[mesh];
+            g_Colliders.push_back(AABB_Transform(obj.bbox_min, obj.bbox_max, model));
+        }
+    };
+
+    // Piso 3x3 e paredes externas (3 painéis de 4 unidades por lado).
+    for (int i = -1; i <= 1; ++i)
+    {
+        for (int j = -1; j <= 1; ++j)
+            add(FLOOR, Matrix_Translate(4.0f*i, 0.0f, 4.0f*j), false);
+
+        const float c = 4.0f * i;
+        add(WALL, Matrix_Translate(c, 0.0f, -5.5f), true);                          // norte
+        add(WALL, Matrix_Translate(c, 0.0f,  5.5f), true);                          // sul
+        add(WALL, Matrix_Translate(-5.5f, 0.0f, c) * Matrix_Rotate_Y( PI_2), true); // oeste
+        add(WALL, Matrix_Translate( 5.5f, 0.0f, c) * Matrix_Rotate_Y(-PI_2), true); // leste
+    }
+
+    // Mureta no meio da sala: a mesma malha de parede, achatada em Y (altura
+    // 4 * 0.35 = 1.4). Serve de obstáculo para colisão e para se esconder.
+    add(WALL, Matrix_Translate(-2.0f, 0.0f, 0.0f) * Matrix_Scale(1.0f, 0.35f, 1.0f), true);
+
+    // Baús.
+    add(CHEST, Matrix_Translate( 3.5f, 0.05f, -3.5f), true);
+    add(CHEST, Matrix_Translate(-3.5f, 0.05f,  3.5f) * Matrix_Rotate_Y(PI_2), true);
+    add(CHEST, Matrix_Translate( 3.5f, 0.05f,  3.0f) * Matrix_Rotate_Y(3.141592f), true);
+
+    // Tochas: ficam coladas na face interna das paredes, com a ponta voltada
+    // para dentro da sala. Cada tocha também gera uma luz pontual, um pouco à
+    // frente e acima dela (onde fica a chama).
+    auto add_torch = [&](float x, float z, float yaw)
+    {
+        glm::mat4 model = Matrix_Translate(x, 1.8f, z) * Matrix_Rotate_Y(yaw);
+        add(TORCH, model, false);
+
+        glm::vec3 dir(sin(yaw), 0.0f, cos(yaw)); // para onde a tocha aponta
+        g_TorchLights.push_back(glm::vec3(x, 2.3f, z) + 0.55f * dir);
+    };
+
+    add_torch(-3.0f, -5.2f, 0.0f);
+    add_torch( 3.0f, -5.2f, 0.0f);
+    add_torch(-3.0f,  5.2f, 3.141592f);
+    add_torch( 3.0f,  5.2f, 3.141592f);
+    add_torch(-5.2f, -3.0f,  PI_2);
+    add_torch(-5.2f,  3.0f,  PI_2);
+    add_torch( 5.2f, -3.0f, -PI_2);
+    add_torch( 5.2f,  3.0f, -PI_2);
+}
+
+// Teste de colisão do jogador: monta a AABB do jogador (centrada em 'p', com os
+// pés em p.y) e testa contra todas as AABBs de paredes e baús.
+bool PlayerCollides(glm::vec3 p)
+{
+    AABB player;
+    player.min = glm::vec3(p.x - PLAYER_HALF_SIZE, p.y,                p.z - PLAYER_HALF_SIZE);
+    player.max = glm::vec3(p.x + PLAYER_HALF_SIZE, p.y + PLAYER_HEIGHT, p.z + PLAYER_HALF_SIZE);
+
+    for (const AABB& box : g_Colliders)
+        if (AABB_Intersects(player, box))
+            return true;
+
+    return false;
+}
+
+// Lê o teclado e move o jogador. O movimento é relativo à câmera (W = para
+// longe da câmera) e proporcional a delta_t.
+void UpdatePlayer(GLFWwindow* window, float delta_t)
+{
+    // Na câmera de mapa, "para cima" na tela é -Z (equivale a theta = 0).
+    const float theta = g_TopDownCamera ? 0.0f : g_CameraTheta;
+
+    // Direções "frente" e "direita" da câmera, projetadas no plano XZ.
+    const glm::vec3 forward(-sin(theta), 0.0f, -cos(theta));
+    const glm::vec3 right  ( cos(theta), 0.0f, -sin(theta));
+
+    glm::vec3 direction(0.0f);
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) direction += forward;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) direction -= forward;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) direction += right;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) direction -= right;
+
+    g_PlayerCrouching = (glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS);
+
+    if (glm::length(direction) < 1e-5f)
+        return;
+
+    direction = glm::normalize(direction);
+    g_PlayerYaw = atan2(direction.x, direction.z); // vira o personagem para onde anda
+
+    const float speed = g_PlayerCrouching ? PLAYER_SPEED_CROUCH : PLAYER_SPEED;
+    const glm::vec3 step = direction * speed * delta_t;
+
+    // Movemos um eixo de cada vez. Assim, ao bater numa parede na diagonal, o
+    // jogador "desliza" ao longo dela em vez de ficar preso.
+    glm::vec3 candidate = g_PlayerPos;
+    candidate.x += step.x;
+    if (!PlayerCollides(candidate))
+        g_PlayerPos = candidate;
+
+    candidate = g_PlayerPos;
+    candidate.z += step.z;
+    if (!PlayerCollides(candidate))
+        g_PlayerPos = candidate;
+}

@@ -33,8 +33,8 @@ uniform vec4 bbox_max;
 uniform sampler2D TextureImage0;
 uniform sampler2D TextureImage1;
 uniform sampler2D TextureImage2;
-uniform vec3 light_positions[4];
-uniform vec3 light_colors[4];
+uniform vec3 light_positions[8];
+uniform vec3 light_colors[8];
 uniform int light_count;
 uniform float ambient_strength;
 
